@@ -1,0 +1,16 @@
+{
+  "name": "lunari-scheduler",
+  "version": "1.0.0",
+  "description": "LUNARI autonomous agent scheduler — runs on Railway",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["lunari", "ai", "scheduler", "agents"],
+  "author": "LUNARI",
+  "license": "MIT"
+}
