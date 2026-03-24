@@ -359,7 +359,7 @@ function handleRequest(req, res) {
     req.on('end', () => {
       try {
         const payload = JSON.parse(body);
-        const apiKey = payload.apiKey;
+        const apiKey = payload.apiKey || CONFIG.ANTHROPIC_KEY;
         const requestBody = payload.body;
 
         if (!apiKey || !requestBody) {
