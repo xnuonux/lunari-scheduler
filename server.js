@@ -352,6 +352,59 @@ function handleRequest(req, res) {
     return;
   }
 
+  // ── Claude API Proxy (fixes CORS for browser) ──
+  if (req.method === 'POST' && url === '/proxy/claude') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      try {
+        const payload = JSON.parse(body);
+        const apiKey = payload.apiKey;
+        const requestBody = payload.body;
+
+        if (!apiKey || !requestBody) {
+          res.writeHead(400);
+          return res.end(JSON.stringify({ error: 'Missing apiKey or body' }));
+        }
+
+        const bodyStr = JSON.stringify(requestBody);
+        const options = {
+          hostname: 'api.anthropic.com',
+          path: '/v1/messages',
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+            'anthropic-beta': 'web-search-2025-03-05',
+            'Content-Length': Buffer.byteLength(bodyStr),
+          },
+        };
+
+        const proxyReq = https.request(options, (proxyRes) => {
+          let data = '';
+          proxyRes.on('data', chunk => data += chunk);
+          proxyRes.on('end', () => {
+            res.writeHead(proxyRes.statusCode, { 'Content-Type': 'application/json' });
+            res.end(data);
+          });
+        });
+
+        proxyReq.on('error', (e) => {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: e.message }));
+        });
+
+        proxyReq.write(bodyStr);
+        proxyReq.end();
+      } catch (e) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'Invalid JSON' }));
+      }
+    });
+    return;
+  }
+
   res.writeHead(404);
   res.end(JSON.stringify({ error: 'Not found' }));
 }
