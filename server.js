@@ -1,4 +1,4 @@
-// LUNARI Scheduler + Execution Backend v3
+// LUNARI Scheduler + Execution Backend v4
 const https  = require('https');
 const http   = require('http');
 const crypto = require('crypto');
@@ -82,9 +82,9 @@ function getNextRun(expr) {
 
 // ── Schedules ────────────────────────────────────
 let SCHEDULES = [
-  {id:'s1',name:'Morning Intelligence Briefing',agent:'scout',prompt:'Research the top 5 most important AI and technology news stories from the last 24 hours. Headline, 2-sentence summary, and why it matters for solo founders.',schedule:'0 8 * * *',email:'',enabled:true,lastRun:null,nextRun:getNextRun('0 8 * * *')},
-  {id:'s2',name:'Weekly Marketing Strategy',agent:'spark',prompt:'Generate a complete 7-day marketing action plan for a solo founder. 3 content ideas, 1 email subject line, 1 growth tactic, 1 competitor to research.',schedule:'0 9 * * 1',email:'',enabled:false,lastRun:null,nextRun:getNextRun('0 9 * * 1')},
-  {id:'s3',name:'Daily Content Piece',agent:'prose',prompt:'Write one high-quality LinkedIn post for a solo founder in the AI/technology space. 150-200 words, strong hook, ends with a question.',schedule:'0 10 * * *',email:'',enabled:false,lastRun:null,nextRun:getNextRun('0 10 * * *')},
+  {id:'s1',name:'Morning Intelligence Briefing',agent:'atlas',prompt:'Research the top 5 most important AI and technology news stories from the last 24 hours. Headline, 2-sentence summary, and why it matters for solo founders.',schedule:'0 8 * * *',email:'',enabled:true,lastRun:null,nextRun:getNextRun('0 8 * * *')},
+  {id:'s2',name:'Weekly Marketing Strategy',agent:'gen',prompt:'Generate a complete 7-day marketing action plan for a solo founder. 3 content ideas, 1 email subject line, 1 growth tactic, 1 competitor to research.',schedule:'0 9 * * 1',email:'',enabled:false,lastRun:null,nextRun:getNextRun('0 9 * * 1')},
+  {id:'s3',name:'Daily Content Piece',agent:'nova',prompt:'Write one high-quality LinkedIn post for a solo founder in the AI/technology space. 150-200 words, strong hook, ends with a question.',schedule:'0 10 * * *',email:'',enabled:false,lastRun:null,nextRun:getNextRun('0 10 * * *')},
 ];
 
 // ── Build system ─────────────────────────────────
@@ -305,8 +305,14 @@ async function executeBuild(task,userId,siteName,jobId) {
 }
 
 // ── Claude API ───────────────────────────────────
-const AGENT_SYSTEMS={nexus:'You are NEXUS, lead agent of LUNARI. Sharp co-founder energy. Strategic and direct.',prose:'You are PROSE, content agent of LUNARI. World-class writer. Full drafts only.',scout:'You are SCOUT, research agent of LUNARI. Surface non-obvious insights.',spark:'You are SPARK, marketing agent of LUNARI. Bold strategist. No hedging.'};
-function callClaude(agent,prompt,apiKey){return new Promise((resolve,reject)=>{const b=JSON.stringify({model:'claude-sonnet-4-6',max_tokens:1500,system:AGENT_SYSTEMS[agent]||AGENT_SYSTEMS.nexus,messages:[{role:'user',content:prompt}]});const o={hostname:'api.anthropic.com',path:'/v1/messages',method:'POST',headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','Content-Length':Buffer.byteLength(b)}};const r=https.request(o,res=>{let d='';res.on('data',c=>d+=c);res.on('end',()=>{try{const p=JSON.parse(d);if(p.error)return reject(new Error(p.error.message));resolve(p.content.filter(b=>b.type==='text').map(b=>b.text).join(''));}catch(e){reject(e);}});});r.on('error',reject);r.write(b);r.end();});}
+const AGENT_SYSTEMS={
+  raven:'You are RAVEN. You lead the LUNARI crew. Think fast, speak like a founder who has already solved the problem. Direct, casual, no padding. You can do anything: plan, build, write, strategize. You know when to pull in the crew.',
+  nova:'You are NOVA. You write. Full drafts only, never outlines. Warm, vivid, never generic. Get into it immediately — no preamble.',
+  atlas:'You are ATLAS. You research and find what others miss. Share findings conversationally, lead with what matters most.',
+  gen:'You are GEN. Bold marketing strategist. Open with the angle, no hedging, real conviction. You have seen what works and what dies.',
+  x:'You are X. One sentence answers, two max. Route to the right crew member when needed. Pure velocity.'
+};
+function callClaude(agent,prompt,apiKey){return new Promise((resolve,reject)=>{const b=JSON.stringify({model:'claude-sonnet-4-6',max_tokens:1500,system:AGENT_SYSTEMS[agent]||AGENT_SYSTEMS.raven,messages:[{role:'user',content:prompt}]});const o={hostname:'api.anthropic.com',path:'/v1/messages',method:'POST',headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','Content-Length':Buffer.byteLength(b)}};const r=https.request(o,res=>{let d='';res.on('data',c=>d+=c);res.on('end',()=>{try{const p=JSON.parse(d);if(p.error)return reject(new Error(p.error.message));resolve(p.content.filter(b=>b.type==='text').map(b=>b.text).join(''));}catch(e){reject(e);}});});r.on('error',reject);r.write(b);r.end();});}
 
 // ── Email ────────────────────────────────────────
 function sendEmail(toEmail,subject,body,agentName){return new Promise((resolve)=>{const p=JSON.stringify({service_id:CONFIG.EMAILJS_SERVICE,template_id:CONFIG.EMAILJS_TEMPLATE,user_id:CONFIG.EMAILJS_KEY,template_params:{to_email:toEmail,subject,body:body.replace(/\*\*/g,'').replace(/\*/g,'').replace(/#+\s/g,''),agent:(agentName||'LUNARI').toUpperCase()}});const o={hostname:'api.emailjs.com',path:'/api/v1.0/email/send',method:'POST',headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(p),'origin':'https://lunari.pro'}};const r=https.request(o,res=>{res.on('data',()=>{});res.on('end',()=>resolve(res.statusCode===200));});r.on('error',()=>resolve(false));r.write(p);r.end();});}
@@ -324,7 +330,7 @@ function handleRequest(req,res){
   if(req.method==='OPTIONS'){res.writeHead(204);return res.end();}
   const url=req.url.split('?')[0];
 
-  if(url==='/'||url==='/health'){res.writeHead(200);return res.end(JSON.stringify({status:'online',service:'LUNARI v3',uptime:Math.floor(process.uptime())+'s',netlify:CONFIG.NETLIFY_TOKEN?'SET':'NOT SET',supabase:CONFIG.SUPABASE_URL?'SET':'NOT SET'}));}
+  if(url==='/'||url==='/health'){res.writeHead(200);return res.end(JSON.stringify({status:'online',service:'LUNARI v4',uptime:Math.floor(process.uptime())+'s',netlify:CONFIG.NETLIFY_TOKEN?'SET':'NOT SET',supabase:CONFIG.SUPABASE_URL?'SET':'NOT SET'}));}
 
   if(req.method==='POST'&&url==='/execute'){
     let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
@@ -351,7 +357,7 @@ function handleRequest(req,res){
 
   if(req.method==='POST'&&url==='/schedules/run'){let b='';req.on('data',c=>b+=c);req.on('end',async()=>{try{const{id}=JSON.parse(b);const s=SCHEDULES.find(s=>s.id===id);if(!s){res.writeHead(404);return res.end(JSON.stringify({error:'Not found'}));}runSchedule(s);res.writeHead(200);res.end(JSON.stringify({ok:true}));}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
 
-  if(req.method==='POST'&&url==='/schedules/add'){let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{const d=JSON.parse(b);const s={id:'s'+Date.now(),name:d.name||'New Schedule',agent:d.agent||'nexus',prompt:d.prompt||'',schedule:d.schedule||'0 8 * * *',email:d.email||'',enabled:false,lastRun:null,nextRun:getNextRun(d.schedule||'0 8 * * *')};SCHEDULES.push(s);res.writeHead(200);res.end(JSON.stringify({ok:true,schedule:s}));}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
+  if(req.method==='POST'&&url==='/schedules/add'){let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{const d=JSON.parse(b);const s={id:'s'+Date.now(),name:d.name||'New Schedule',agent:d.agent||'raven',prompt:d.prompt||'',schedule:d.schedule||'0 8 * * *',email:d.email||'',enabled:false,lastRun:null,nextRun:getNextRun(d.schedule||'0 8 * * *')};SCHEDULES.push(s);res.writeHead(200);res.end(JSON.stringify({ok:true,schedule:s}));}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
 
   if(req.method==='POST'&&url==='/schedules/delete'){let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{const{id}=JSON.parse(b);SCHEDULES=SCHEDULES.filter(s=>s.id!==id);res.writeHead(200);res.end(JSON.stringify({ok:true}));}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
 
