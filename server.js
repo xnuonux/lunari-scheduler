@@ -124,17 +124,39 @@ function buildWithClaude(task, buildType, siteName) {
 }
 
 function assignCustomDomain(siteId, domain) {
-  return new Promise((resolve,reject) => {
-    const body=JSON.stringify({domain});
-    const opts={hostname:'api.netlify.com',path:`/api/v1/sites/${siteId}/domain`,method:'PUT',headers:{'Content-Type':'application/json','Authorization':'Bearer '+CONFIG.NETLIFY_TOKEN,'Content-Length':Buffer.byteLength(body)}};
-    const req=https.request(opts,res=>{let d='';res.on('data',c=>d+=c);res.on('end',()=>{console.log('[BUILD] Domain assign: '+res.statusCode);if(res.statusCode===200||res.statusCode===201)resolve();else reject(new Error('Domain assign failed: '+res.statusCode+' '+d.slice(0,100)));});});
-    req.on('error',reject);req.write(body);req.end();
+  return new Promise((resolve, reject) => {
+    // Netlify uses POST to /api/v1/sites/{id}/aliases to add a domain alias
+    const body = JSON.stringify([domain]);
+    const opts = {
+      hostname: 'api.netlify.com',
+      path: `/api/v1/sites/${siteId}`,
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + CONFIG.NETLIFY_TOKEN,
+        'Content-Length': Buffer.byteLength(JSON.stringify({custom_domain: domain}))
+      }
+    };
+    const patchBody = JSON.stringify({custom_domain: domain});
+    const req = https.request(opts, res => {
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => {
+        console.log('[BUILD] Domain assign status: ' + res.statusCode);
+        if (res.statusCode === 200 || res.statusCode === 201) resolve();
+        else reject(new Error('Domain assign failed: ' + res.statusCode + ' ' + d.slice(0,100)));
+      });
+    });
+    req.on('error', reject);
+    req.write(patchBody);
+    req.end();
   });
 }
 
 function deployToNetlify(html, slug) {
   return new Promise((resolve,reject) => {
-    const siteName='lunari-'+slug;
+    // Use a unique but generic site name to avoid path confusion
+    const uniqueId = Math.random().toString(36).slice(2,10);
+    const siteName='lunari-build-'+uniqueId;
     const cb=JSON.stringify({name:siteName});
     const co={hostname:'api.netlify.com',path:'/api/v1/sites',method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+CONFIG.NETLIFY_TOKEN,'Content-Length':Buffer.byteLength(cb)}};
     const cr=https.request(co,res=>{let d='';res.on('data',c=>d+=c);res.on('end',()=>{
