@@ -300,6 +300,10 @@ async function executeBuild(task,userId,siteName,jobId) {
     const result=await deployToNetlify(html,slug);
     await incrementSiteCount(userId);
     BUILD_RESULTS[jobId]={status:'done',url:result.url,siteId:result.siteId,message:'Live at '+result.url,userId,builtAt:new Date().toISOString()};
+
+    // Auto-tweet from @LunariPro
+    postLunariBuildTweet(result.url, siteName || task.slice(0,40), null);
+
     return BUILD_RESULTS[jobId];
   }catch(err){BUILD_RESULTS[jobId]={status:'error',error:err.message};throw err;}
 }
@@ -373,12 +377,57 @@ const TWITTER = {
   CLIENT_SECRET: process.env.TWITTER_CLIENT_SECRET || '',
   API_KEY:       process.env.TWITTER_API_KEY        || '',
   API_SECRET:    process.env.TWITTER_API_SECRET     || '',
+  LUNARI_TOKEN:  process.env.LUNARI_TWITTER_TOKEN   || '',
+  LUNARI_SECRET: process.env.LUNARI_TWITTER_SECRET  || '',
   REDIRECT_URI:  'https://nodejs-production-63513.up.railway.app/auth/twitter/callback',
   SCOPE:         'tweet.read tweet.write users.read offline.access',
 };
 
 const TWITTER_TOKENS = {};
-const TWITTER_STATES = {}; // PKCE state store
+const TWITTER_STATES = {};
+
+// ── LUNARI auto-tweet on every build ─────────────
+function oauthSign(method, url, params, consumerKey, consumerSecret, tokenKey, tokenSecret) {
+  const oauthParams = {
+    oauth_consumer_key: consumerKey,
+    oauth_nonce: crypto.randomBytes(16).toString('hex'),
+    oauth_signature_method: 'HMAC-SHA1',
+    oauth_timestamp: Math.floor(Date.now()/1000).toString(),
+    oauth_token: tokenKey,
+    oauth_version: '1.0',
+    ...params
+  };
+  const sorted = Object.keys(oauthParams).sort().map(k =>
+    encodeURIComponent(k) + '=' + encodeURIComponent(oauthParams[k])
+  ).join('&');
+  const base = method.toUpperCase() + '&' + encodeURIComponent(url) + '&' + encodeURIComponent(sorted);
+  const signingKey = encodeURIComponent(consumerSecret) + '&' + encodeURIComponent(tokenSecret);
+  const sig = crypto.createHmac('sha1', signingKey).update(base).digest('base64');
+  oauthParams.oauth_signature = sig;
+  const header = 'OAuth ' + Object.keys(oauthParams).sort().map(k =>
+    encodeURIComponent(k) + '="' + encodeURIComponent(oauthParams[k]) + '"'
+  ).join(', ');
+  return header;
+}
+
+function postLunariBuildTweet(siteUrl, siteName, userHandle) {
+  if (!TWITTER.API_KEY || !TWITTER.API_SECRET || !TWITTER.LUNARI_TOKEN || !TWITTER.LUNARI_SECRET) return;
+  const handle = userHandle ? ' for @' + userHandle : '';
+  const text = '🚀 just built' + handle + ' — ' + siteUrl + '\n\nbuilt in under 2 minutes with LUNARI. no code. no setup. just a prompt.\n\nlunari.pro 🌙';
+  const tweetUrl = 'https://api.twitter.com/2/tweets';
+  const body = JSON.stringify({ text: text.slice(0, 280) });
+  const authHeader = oauthSign('POST', tweetUrl, {}, TWITTER.API_KEY, TWITTER.API_SECRET, TWITTER.LUNARI_TOKEN, TWITTER.LUNARI_SECRET);
+  const opts = {
+    hostname: 'api.twitter.com', path: '/2/tweets', method: 'POST',
+    headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+  };
+  const req = https.request(opts, res => {
+    let d = ''; res.on('data', c => d += c);
+    res.on('end', () => console.log('[LUNARI TWEET] status:', res.statusCode, d.slice(0,100)));
+  });
+  req.on('error', e => console.error('[LUNARI TWEET] error:', e.message));
+  req.write(body); req.end();
+}
 
 // In-memory token store (keyed by userId) — backed by Supabase
 const GMAIL_TOKENS = {};
