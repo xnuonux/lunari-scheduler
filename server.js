@@ -108,8 +108,25 @@ function generateSlug(text) {
 
 function buildWithClaude(task, buildType, siteName) {
   return new Promise((resolve,reject) => {
-    const system=`You are an elite web developer. Output ONLY a complete HTML file. Start immediately with <!DOCTYPE html>. No explanation, no markdown, no code fences. All CSS in <style> tags, all JS in <script> tags. Make it visually stunning — animated hero, gradient backgrounds, real content, professional typography. The page must look fully rendered and impressive on first load.`;
-    const user=`Build a complete ${buildType} website.\nTask: ${task}\nBrand: ${siteName||'extract from task'}\nRequirements: animated hero with headline + CTA button, features/services section with icons, about or social proof section, footer. Mobile responsive. Use bold colors and modern design. Output ONLY the HTML starting with <!DOCTYPE html>.`;
+    const system=`You are a web developer. Output a single HTML file. Rules: (1) Start with <!DOCTYPE html> immediately. (2) No markdown, no code fences, no explanation. (3) The body MUST have visible text content — headings, paragraphs, buttons. (4) Text must be a different color from the background. (5) Use white or light colored text on dark backgrounds, or dark text on light backgrounds. (6) Never use CSS that hides or makes content invisible. (7) Include at minimum: a visible h1 heading, a paragraph of text, and a styled button. These must be readable on screen.`;
+    const user=`Build a landing page for: ${task}
+Brand name: ${siteName||'extract from the task'}
+
+Your output must be a complete HTML file starting with <!DOCTYPE html>.
+
+The page must include ALL of these visible elements:
+1. A large H1 heading with the brand name (use color: #c8f04a or similar bright color)
+2. A subheading paragraph describing what the product does (use color: #cccccc)
+3. A CTA button with background-color and contrasting text
+4. A features section with at least 3 items
+5. A footer
+
+CSS requirements:
+- body { background-color: #0d0d1a; color: #ffffff; margin: 0; font-family: sans-serif; }
+- All text must be visible — light text on dark background
+- Do NOT use visibility:hidden, opacity:0, or display:none on main content
+
+Start your response with <!DOCTYPE html> immediately. No other text.`;
     const rb=JSON.stringify({model:'claude-opus-4-6',max_tokens:8000,system,messages:[{role:'user',content:user}]});
     const opts={hostname:'api.anthropic.com',path:'/v1/messages',method:'POST',headers:{'Content-Type':'application/json','x-api-key':CONFIG.ANTHROPIC_KEY,'anthropic-version':'2023-06-01','Content-Length':Buffer.byteLength(rb)}};
     const req=https.request(opts,res=>{let d='';res.on('data',c=>d+=c);res.on('end',()=>{
