@@ -676,67 +676,56 @@ async function sendGmail(userId, to, subject, body) {
 
         // Map Stripe price IDs to plan names and Fuel amounts
         const PRICE_MAP = {
-          // Subscriptions — fill in your actual price IDs from Stripe dashboard
-          'price_starter':    { plan: 'starter',    credits: 9,   site_limit: 1 },
-          'price_pro':        { plan: 'pro',         credits: 30,  site_limit: 2 },
-          'price_studio':     { plan: 'studio',      credits: 100, site_limit: 5 },
-          // Fuel packs — one-time payments
-          'price_spark':      { credits: 1  },
-          'price_duo':        { credits: 2  },
-          'price_trio':       { credits: 3  },
-          'price_five':       { credits: 5  },
-          'price_eight':      { credits: 8  },
-          'price_thirteen':   { credits: 13 },
-          'price_twentyone':  { credits: 21 },
-          'price_thirtyfour': { credits: 34 },
-          'price_fiftyfive':  { credits: 55 },
-          'price_eightynine': { credits: 89 },
+          // Subscriptions
+          'price_1TEafeRuX5YO2iLP9OorMAUA': { plan: 'starter', credits: 9,   site_limit: 1 },
+          'price_1TEabuRuX5YO2iLPltK7fRUE': { plan: 'pro',     credits: 30,  site_limit: 2 },
+          'price_1TEacmRuX5YO2iLPBsNpLeJH': { plan: 'studio',  credits: 100, site_limit: 5 },
+          // Fuel packs
+          'price_1TEa52RuX5YO2iLPHkLXpfft': { credits: 1  },
+          'price_1TEa6GRuX5YO2iLPd18IiD2D': { credits: 2  },
+          'price_1TEa74RuX5YO2iLPhdHQgSAS': { credits: 3  },
+          'price_1TEa7dRuX5YO2iLPAcymE8gi': { credits: 5  },
+          'price_1TEaA1RuX5YO2iLPWRkiCbe2': { credits: 8  },
+          'price_1TEaAYRuX5YO2iLPbf2zcRFa': { credits: 13 },
+          'price_1TEaBERuX5YO2iLP1JtxG1p2': { credits: 21 },
+          'price_1TEaC9RuX5YO2iLP8IDRGN20': { credits: 34 },
+          'price_1TEaCgRuX5YO2iLPukFteO0Z': { credits: 55 },
+          'price_1TEaDPRuX5YO2iLPTDYqWkxn': { credits: 89 },
         };
 
         if (event.type === 'checkout.session.completed') {
           const session = event.data.object;
+          const userId = session.client_reference_id;
           const customerEmail = session.customer_details && session.customer_details.email;
-          const priceId = session.metadata && session.metadata.price_id;
-          const lineItems = session.line_items;
+          const priceId = (session.metadata && session.metadata.price_id) || '';
 
-          console.log('[STRIPE] Session email:', customerEmail, 'price:', priceId);
+          console.log('[STRIPE] userId:', userId, 'email:', customerEmail, 'price:', priceId);
 
-          // Find user by email in Supabase
-          if (customerEmail) {
-            const users = await sbFetch('GET', `auth.users?email=eq.${encodeURIComponent(customerEmail)}&select=id&limit=1`).catch(() => null);
-
-            // Try profiles table if auth.users not accessible
-            let userId = null;
-            if (users && users[0]) {
-              userId = users[0].id;
+          if (userId && priceId && PRICE_MAP[priceId]) {
+            const mapping = PRICE_MAP[priceId];
+            if (mapping.plan) {
+              // Subscription
+              await sbFetch('PATCH', `user_credits?user_id=eq.${userId}`, {
+                plan: mapping.plan,
+                credits: mapping.credits,
+                site_limit: mapping.site_limit,
+                updated_at: new Date().toISOString()
+              });
+              console.log('[STRIPE] ✓ Plan updated to', mapping.plan, 'for', userId);
             } else {
-              // Search user_credits by matching — Supabase may not expose auth.users directly
-              const credits = await sbFetch('GET', `user_credits?select=user_id&limit=100`).catch(() => null);
-              // We'll use metadata approach instead
+              // Fuel pack — add to existing balance
+              const current = await sbFetch('GET', `user_credits?user_id=eq.${userId}&select=credits&limit=1`).catch(() => null);
+              const currentCredits = (current && current[0]) ? (current[0].credits || 0) : 0;
+              await sbFetch('PATCH', `user_credits?user_id=eq.${userId}`, {
+                credits: currentCredits + mapping.credits,
+                updated_at: new Date().toISOString()
+              });
+              console.log('[STRIPE] ✓ Added', mapping.credits, 'Fuel →', currentCredits + mapping.credits, 'total for', userId);
             }
-
-            if (userId && priceId && PRICE_MAP[priceId]) {
-              const mapping = PRICE_MAP[priceId];
-              if (mapping.plan) {
-                // Subscription — update plan and add credits
-                await sbFetch('PATCH', `user_credits?user_id=eq.${userId}`, {
-                  plan: mapping.plan,
-                  credits: mapping.credits,
-                  site_limit: mapping.site_limit,
-                  updated_at: new Date().toISOString()
-                });
-                console.log('[STRIPE] Updated plan to', mapping.plan, 'for', userId);
-              } else {
-                // Fuel pack — add credits to existing
-                const current = await sbFetch('GET', `user_credits?user_id=eq.${userId}&select=credits&limit=1`).catch(() => null);
-                const currentCredits = (current && current[0]) ? (current[0].credits || 0) : 0;
-                await sbFetch('PATCH', `user_credits?user_id=eq.${userId}`, {
-                  credits: currentCredits + mapping.credits,
-                  updated_at: new Date().toISOString()
-                });
-                console.log('[STRIPE] Added', mapping.credits, 'Fuel to', userId);
-              }
-            }
+          } else if (!userId) {
+            console.log('[STRIPE] No client_reference_id — user was not logged in at checkout');
+          } else if (!PRICE_MAP[priceId]) {
+            console.log('[STRIPE] Unknown price ID:', priceId);
           }
         }
 
