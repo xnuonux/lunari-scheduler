@@ -252,13 +252,13 @@ function deployToNetlify(html, slug) {
                       const liveUrl = site.ssl_url || site.url || ('https://' + siteName + '.netlify.app');
                       console.log('[BUILD] Live at: ' + liveUrl);
 
-                      // Attempt custom domain assignment (best-effort, non-blocking)
                       const cleanName = slug.split('-').slice(0,-1).join('-') || slug;
                       const customDomain = cleanName + '.lunari.pro';
                       assignCustomDomain(site.id, customDomain)
                         .then(() => {
                           console.log('[BUILD] Custom domain assigned: ' + customDomain);
-                          resolve({ url: liveUrl, customDomain: customDomain, siteId: site.id });
+                          // Use custom domain as the primary URL
+                          resolve({ url: 'https://' + customDomain, siteId: site.id });
                         })
                         .catch(e => {
                           console.log('[BUILD] Custom domain skipped: ' + e.message);
