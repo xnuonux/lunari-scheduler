@@ -169,39 +169,116 @@ function assignCustomDomain(siteId, domain) {
   });
 }
 
+function waitForDeploy(deployId, attempts) {
+  attempts = attempts || 0;
+  return new Promise((resolve, reject) => {
+    if (attempts > 20) return resolve(); // give up waiting after ~60s, URL should work by then
+    setTimeout(function() {
+      const opts = {
+        hostname: 'api.netlify.com',
+        path: `/api/v1/deploys/${deployId}`,
+        method: 'GET',
+        headers: { 'Authorization': 'Bearer ' + CONFIG.NETLIFY_TOKEN }
+      };
+      const req = https.request(opts, res => {
+        let d = ''; res.on('data', c => d += c);
+        res.on('end', () => {
+          try {
+            const deploy = JSON.parse(d);
+            console.log('[BUILD] Deploy state: ' + deploy.state);
+            if (deploy.state === 'ready' || deploy.state === 'uploaded') {
+              resolve();
+            } else if (deploy.state === 'error') {
+              reject(new Error('Deploy errored'));
+            } else {
+              // still building — check again
+              waitForDeploy(deployId, attempts + 1).then(resolve).catch(reject);
+            }
+          } catch(e) { resolve(); } // parse error, just continue
+        });
+      });
+      req.on('error', () => resolve());
+      req.end();
+    }, 3000); // check every 3 seconds
+  });
+}
+
 function deployToNetlify(html, slug) {
   return new Promise((resolve,reject) => {
-    // Use a unique but generic site name to avoid path confusion
     const uniqueId = Math.random().toString(36).slice(2,10);
-    const siteName='lunari-build-'+uniqueId;
-    const cb=JSON.stringify({name:siteName});
-    const co={hostname:'api.netlify.com',path:'/api/v1/sites',method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+CONFIG.NETLIFY_TOKEN,'Content-Length':Buffer.byteLength(cb)}};
-    const cr=https.request(co,res=>{let d='';res.on('data',c=>d+=c);res.on('end',()=>{
-      try{const site=JSON.parse(d);if(!site.id)return reject(new Error('Site creation failed: '+d.slice(0,200)));
-      console.log('[BUILD] Site: '+site.id);
-      const hb=Buffer.from(html,'utf8');
-      const sha1=crypto.createHash('sha1').update(hb).digest('hex');
-      const db=JSON.stringify({files:{'/index.html':sha1},draft:false});
-      const dopt={hostname:'api.netlify.com',path:`/api/v1/sites/${site.id}/deploys`,method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+CONFIG.NETLIFY_TOKEN,'Content-Length':Buffer.byteLength(db)}};
-      const dr=https.request(dopt,dres=>{let dd='';dres.on('data',c=>dd+=c);dres.on('end',()=>{
-        try{const deploy=JSON.parse(dd);if(!deploy.id)return reject(new Error('Deploy failed: '+dd.slice(0,200)));
-        console.log('[BUILD] Deploy: '+deploy.id);
-        const uo={hostname:'api.netlify.com',path:`/api/v1/deploys/${deploy.id}/files/index.html`,method:'PUT',headers:{'Content-Type':'text/html; charset=utf-8','Authorization':'Bearer '+CONFIG.NETLIFY_TOKEN,'Content-Length':hb.length}};
-        const ur=https.request(uo,ures=>{let ud='';ures.on('data',c=>ud+=c);ures.on('end',()=>{
-          console.log('[BUILD] Upload: '+ures.statusCode);
-          const cleanName=slug.split('-').slice(0,-1).join('-')||slug;
-          const customDomain=cleanName+'.lunari.pro';
-          assignCustomDomain(site.id,customDomain)
-            .then(()=>{console.log('[BUILD] Domain: '+customDomain);resolve({url:'https://'+customDomain,siteId:site.id});})
-            .catch(e=>{console.log('[BUILD] Domain fallback: '+e.message);resolve({url:site.ssl_url||site.url||'https://'+siteName+'.netlify.app',siteId:site.id});});
-        });});
-        ur.on('error',reject);ur.write(hb);ur.end();
-        }catch(e){reject(e);}
-      });});
-      dr.on('error',reject);dr.write(db);dr.end();
-      }catch(e){reject(e);}
-    });});
-    cr.on('error',reject);cr.write(cb);cr.end();
+    const siteName = 'lunari-build-' + uniqueId;
+    const cb = JSON.stringify({ name: siteName });
+    const co = {
+      hostname: 'api.netlify.com', path: '/api/v1/sites', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + CONFIG.NETLIFY_TOKEN, 'Content-Length': Buffer.byteLength(cb) }
+    };
+    const cr = https.request(co, res => {
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => {
+        try {
+          const site = JSON.parse(d);
+          if (!site.id) return reject(new Error('Site creation failed: ' + d.slice(0,200)));
+          console.log('[BUILD] Site: ' + site.id);
+
+          const hb = Buffer.from(html, 'utf8');
+          const sha1 = crypto.createHash('sha1').update(hb).digest('hex');
+          const db = JSON.stringify({ files: { '/index.html': sha1 }, draft: false });
+          const dopt = {
+            hostname: 'api.netlify.com', path: `/api/v1/sites/${site.id}/deploys`, method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + CONFIG.NETLIFY_TOKEN, 'Content-Length': Buffer.byteLength(db) }
+          };
+          const dr = https.request(dopt, dres => {
+            let dd = ''; dres.on('data', c => dd += c);
+            dres.on('end', () => {
+              try {
+                const deploy = JSON.parse(dd);
+                if (!deploy.id) return reject(new Error('Deploy failed: ' + dd.slice(0,200)));
+                console.log('[BUILD] Deploy: ' + deploy.id);
+
+                // Upload file
+                const uo = {
+                  hostname: 'api.netlify.com',
+                  path: `/api/v1/deploys/${deploy.id}/files/index.html`,
+                  method: 'PUT',
+                  headers: { 'Content-Type': 'text/html; charset=utf-8', 'Authorization': 'Bearer ' + CONFIG.NETLIFY_TOKEN, 'Content-Length': hb.length }
+                };
+                const ur = https.request(uo, ures => {
+                  let ud = ''; ures.on('data', c => ud += c);
+                  ures.on('end', () => {
+                    console.log('[BUILD] Upload: ' + ures.statusCode);
+
+                    // Wait for deploy to be ready, then return the live URL
+                    waitForDeploy(deploy.id).then(() => {
+                      const liveUrl = site.ssl_url || site.url || ('https://' + siteName + '.netlify.app');
+                      console.log('[BUILD] Live at: ' + liveUrl);
+
+                      // Attempt custom domain assignment (best-effort, non-blocking)
+                      const cleanName = slug.split('-').slice(0,-1).join('-') || slug;
+                      const customDomain = cleanName + '.lunari.pro';
+                      assignCustomDomain(site.id, customDomain)
+                        .then(() => {
+                          console.log('[BUILD] Custom domain assigned: ' + customDomain);
+                          resolve({ url: liveUrl, customDomain: customDomain, siteId: site.id });
+                        })
+                        .catch(e => {
+                          console.log('[BUILD] Custom domain skipped: ' + e.message);
+                          resolve({ url: liveUrl, siteId: site.id });
+                        });
+                    }).catch(() => {
+                      const liveUrl = site.ssl_url || site.url || ('https://' + siteName + '.netlify.app');
+                      resolve({ url: liveUrl, siteId: site.id });
+                    });
+                  });
+                });
+                ur.on('error', reject); ur.write(hb); ur.end();
+              } catch(e) { reject(e); }
+            });
+          });
+          dr.on('error', reject); dr.write(db); dr.end();
+        } catch(e) { reject(e); }
+      });
+    });
+    cr.on('error', reject); cr.write(cb); cr.end();
   });
 }
 
