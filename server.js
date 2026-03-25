@@ -361,7 +361,221 @@ function handleRequest(req,res){
 
   if(req.method==='POST'&&url==='/schedules/delete'){let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{const{id}=JSON.parse(b);SCHEDULES=SCHEDULES.filter(s=>s.id!==id);res.writeHead(200);res.end(JSON.stringify({ok:true}));}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
 
+const GMAIL = {
+  CLIENT_ID:     process.env.GMAIL_CLIENT_ID     || '',
+  CLIENT_SECRET: process.env.GMAIL_CLIENT_SECRET || '',
+  REDIRECT_URI:  'https://nodejs-production-63513.up.railway.app/auth/gmail/callback',
+  SCOPE:         'https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/userinfo.email',
+};
+
+// In-memory token store (keyed by userId) — backed by Supabase
+const GMAIL_TOKENS = {};
+
+function gmailRequest(path, method, body, token) {
+  return new Promise((resolve, reject) => {
+    const bodyStr = body ? JSON.stringify(body) : null;
+    const opts = {
+      hostname: 'www.googleapis.com', path, method,
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }
+    };
+    if (bodyStr) opts.headers['Content-Length'] = Buffer.byteLength(bodyStr);
+    const req = https.request(opts, res => {
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => { try { resolve({ status: res.statusCode, data: JSON.parse(d) }); } catch(e) { resolve({ status: res.statusCode, data: d }); } });
+    });
+    req.on('error', reject);
+    if (bodyStr) req.write(bodyStr);
+    req.end();
+  });
+}
+
+function refreshGmailToken(refreshToken) {
+  return new Promise((resolve, reject) => {
+    const body = new URLSearchParams({
+      client_id: GMAIL.CLIENT_ID,
+      client_secret: GMAIL.CLIENT_SECRET,
+      refresh_token: refreshToken,
+      grant_type: 'refresh_token'
+    }).toString();
+    const opts = {
+      hostname: 'oauth2.googleapis.com', path: '/token', method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) }
+    };
+    const req = https.request(opts, res => {
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => {
+        try {
+          const p = JSON.parse(d);
+          if (p.access_token) resolve(p.access_token);
+          else reject(new Error('Refresh failed: ' + d));
+        } catch(e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+async function getGmailToken(userId) {
+  // Check memory first
+  if (GMAIL_TOKENS[userId] && GMAIL_TOKENS[userId].access_token) {
+    // Check if expired (expires_at is unix ms)
+    if (!GMAIL_TOKENS[userId].expires_at || Date.now() < GMAIL_TOKENS[userId].expires_at - 60000) {
+      return GMAIL_TOKENS[userId].access_token;
+    }
+    // Refresh it
+    if (GMAIL_TOKENS[userId].refresh_token) {
+      const newToken = await refreshGmailToken(GMAIL_TOKENS[userId].refresh_token);
+      GMAIL_TOKENS[userId].access_token = newToken;
+      GMAIL_TOKENS[userId].expires_at = Date.now() + 3500000;
+      return newToken;
+    }
+  }
+  // Load from Supabase
+  const rows = await sbFetch('GET', `gmail_tokens?user_id=eq.${userId}&select=access_token,refresh_token,expires_at&limit=1`);
+  if (rows && rows[0]) {
+    GMAIL_TOKENS[userId] = rows[0];
+    if (Date.now() < rows[0].expires_at - 60000) return rows[0].access_token;
+    if (rows[0].refresh_token) {
+      const newToken = await refreshGmailToken(rows[0].refresh_token);
+      GMAIL_TOKENS[userId].access_token = newToken;
+      GMAIL_TOKENS[userId].expires_at = Date.now() + 3500000;
+      await sbFetch('PATCH', `gmail_tokens?user_id=eq.${userId}`, { access_token: newToken, expires_at: GMAIL_TOKENS[userId].expires_at });
+      return newToken;
+    }
+  }
+  return null;
+}
+
+async function sendGmail(userId, to, subject, body) {
+  const token = await getGmailToken(userId);
+  if (!token) return { ok: false, error: 'not_connected' };
+
+  // Build RFC 2822 email
+  const emailLines = [
+    'To: ' + to,
+    'Subject: ' + subject,
+    'Content-Type: text/plain; charset=utf-8',
+    '',
+    body
+  ];
+  const raw = Buffer.from(emailLines.join('\r\n')).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+
+  const result = await gmailRequest('/gmail/v1/users/me/messages/send', 'POST', { raw }, token);
+  if (result.status === 200 || result.status === 201) return { ok: true, messageId: result.data.id };
+  if (result.status === 401) return { ok: false, error: 'token_expired' };
+  return { ok: false, error: JSON.stringify(result.data).slice(0, 100) };
+}
+
   if(req.method==='POST'&&url==='/proxy/claude'){let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{const pl=JSON.parse(b);const apiKey=pl.apiKey||CONFIG.ANTHROPIC_KEY;const rb=pl.body;if(!apiKey||!rb){res.writeHead(400);return res.end(JSON.stringify({error:'Missing fields'}));}const bs=JSON.stringify(rb);const o={hostname:'api.anthropic.com',path:'/v1/messages',method:'POST',headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','anthropic-beta':'web-search-2025-03-05','Content-Length':Buffer.byteLength(bs)}};const pr=https.request(o,pres=>{let d='';pres.on('data',c=>d+=c);pres.on('end',()=>{res.writeHead(pres.statusCode,{'Content-Type':'application/json'});res.end(d);});});pr.on('error',e=>{res.writeHead(500);res.end(JSON.stringify({error:e.message}));});pr.write(bs);pr.end();}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
+
+  // ── GMAIL OAUTH ───────────────────────────────────
+
+  // Step 1: Frontend requests auth URL
+  if(req.method==='GET'&&url.startsWith('/auth/gmail/connect')){
+    const params = new URLSearchParams(req.url.split('?')[1]||'');
+    const userId = params.get('userId')||'';
+    const state = Buffer.from(JSON.stringify({userId})).toString('base64');
+    const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?' +
+      'client_id=' + GMAIL.CLIENT_ID +
+      '&redirect_uri=' + encodeURIComponent(GMAIL.REDIRECT_URI) +
+      '&response_type=code' +
+      '&scope=' + encodeURIComponent(GMAIL.SCOPE) +
+      '&access_type=offline&prompt=consent' +
+      '&state=' + encodeURIComponent(state);
+    res.writeHead(200);
+    return res.end(JSON.stringify({url: authUrl}));
+  }
+
+  // Step 2: Google redirects back with code
+  if(req.method==='GET'&&url.startsWith('/auth/gmail/callback')){
+    const params = new URLSearchParams(req.url.split('?')[1]||'');
+    const code = params.get('code');
+    const stateParam = params.get('state');
+    if(!code){res.writeHead(400);return res.end('Missing code');}
+
+    let userId = '';
+    try { userId = JSON.parse(Buffer.from(decodeURIComponent(stateParam||''),'base64').toString()).userId; } catch(e){}
+
+    // Exchange code for tokens
+    const tokenBody = new URLSearchParams({
+      code, client_id: GMAIL.CLIENT_ID, client_secret: GMAIL.CLIENT_SECRET,
+      redirect_uri: GMAIL.REDIRECT_URI, grant_type: 'authorization_code'
+    }).toString();
+
+    const tokenOpts = {
+      hostname:'oauth2.googleapis.com', path:'/token', method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded','Content-Length':Buffer.byteLength(tokenBody)}
+    };
+    const tokenReq = https.request(tokenOpts, tokenRes => {
+      let d=''; tokenRes.on('data',c=>d+=c);
+      tokenRes.on('end', async () => {
+        try {
+          const tokens = JSON.parse(d);
+          if(!tokens.access_token){
+            res.writeHead(400);
+            return res.end('<html><body><h2>Auth failed</h2><p>'+d+'</p></body></html>');
+          }
+          const expiresAt = Date.now() + (tokens.expires_in||3600)*1000;
+
+          // Get user email from Google
+          const userInfo = await gmailRequest('/oauth2/v2/userinfo', 'GET', null, tokens.access_token).catch(()=>({data:{}}));
+          const gmailEmail = userInfo.data.email || '';
+
+          // Store in memory + Supabase
+          GMAIL_TOKENS[userId] = { access_token: tokens.access_token, refresh_token: tokens.refresh_token, expires_at: expiresAt, email: gmailEmail };
+          await sbFetch('POST', 'gmail_tokens', { user_id: userId, access_token: tokens.access_token, refresh_token: tokens.refresh_token||'', expires_at: expiresAt, email: gmailEmail });
+
+          // Close popup and signal success
+          res.writeHead(200, {'Content-Type':'text/html'});
+          res.end('<html><head><script>window.opener&&window.opener.postMessage({type:"gmail_connected",email:"'+gmailEmail+'"},"*");setTimeout(()=>window.close(),1000);</script></head><body style="background:#07080f;color:#dce3f0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;"><h2 style="color:#c9a84c;">Gmail connected ✓</h2></body></html>');
+        } catch(e) {
+          res.writeHead(500);
+          res.end('<html><body><h2>Error: '+e.message+'</h2></body></html>');
+        }
+      });
+    });
+    tokenReq.on('error', e=>{res.writeHead(500);res.end(e.message);});
+    tokenReq.write(tokenBody);
+    tokenReq.end();
+    return;
+  }
+
+  // Step 3: Check if user has Gmail connected
+  if(req.method==='GET'&&url.startsWith('/auth/gmail/status')){
+    const params = new URLSearchParams(req.url.split('?')[1]||'');
+    const userId = params.get('userId')||'';
+    getGmailToken(userId).catch(()=>null).then(function(token){
+      const tokenData = GMAIL_TOKENS[userId];
+      res.writeHead(200);
+      res.end(JSON.stringify({ connected: !!token, email: (tokenData&&tokenData.email)||'' }));
+    });
+  }
+
+  // Step 4: Disconnect Gmail
+  if(req.method==='POST'&&url==='/auth/gmail/disconnect'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try {
+        const{userId}=JSON.parse(b);
+        delete GMAIL_TOKENS[userId];
+        await sbFetch('DELETE', `gmail_tokens?user_id=eq.${userId}`);
+        res.writeHead(200);res.end(JSON.stringify({ok:true}));
+      }catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}
+    });return;
+  }
+
+  // Step 5: Send email via Gmail
+  if(req.method==='POST'&&url==='/gmail/send'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try {
+        const{userId,to,subject,body}=JSON.parse(b);
+        if(!userId||!to||!subject||!body){res.writeHead(400);return res.end(JSON.stringify({error:'Missing fields'}));}
+        const result = await sendGmail(userId, to, subject, body);
+        res.writeHead(200);res.end(JSON.stringify(result));
+      }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
+    });return;
+  }
 
   res.writeHead(404);res.end(JSON.stringify({error:'Not found'}));
 }
