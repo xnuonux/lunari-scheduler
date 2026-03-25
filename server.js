@@ -65,7 +65,7 @@ function generateSlug(text) {
 
 function buildWithClaude(task, buildType, siteName) {
   return new Promise((resolve,reject) => {
-    const system=`You are an elite web developer. Build complete, beautiful, production-ready websites as a single HTML file. RULES: Output ONLY raw HTML starting with <!DOCTYPE html>. No explanation, no markdown, no code fences. All CSS in <style> tags, all JS in <script> tags. Google Fonts OK. Mobile responsive. Premium polished design. Real content, never Lorem ipsum.`;
+    const system=`You are an elite web developer. Your ONLY job is to output a single complete HTML file. CRITICAL: Your entire response must be ONLY the HTML file. Start your response with <!DOCTYPE html> on the very first character. No preamble, no explanation, no markdown, no code fences. The HTML must render visible content immediately — include actual text, colors, images described with CSS, everything needed. Use inline CSS in a <style> tag. Use a body background color, real fonts, visible hero text, visible buttons. The page must look professional and fully rendered on first load.`;
     const user=`Build a complete ${buildType} website.\nTask: ${task}\nBrand: ${siteName||'extract from task'}\nInclude: hero with headline+CTA, features section, about/social proof, footer. Mobile responsive. Professional animations. Start with <!DOCTYPE html> immediately.`;
     const rb=JSON.stringify({model:'claude-opus-4-6',max_tokens:8000,system,messages:[{role:'user',content:user}]});
     const opts={hostname:'api.anthropic.com',path:'/v1/messages',method:'POST',headers:{'Content-Type':'application/json','x-api-key':CONFIG.ANTHROPIC_KEY,'anthropic-version':'2023-06-01','Content-Length':Buffer.byteLength(rb)}};
