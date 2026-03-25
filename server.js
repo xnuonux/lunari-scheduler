@@ -76,27 +76,104 @@ function buildWithClaude(task, buildType, siteName) {
 
 function deployToNetlify(html, slug) {
   return new Promise((resolve,reject) => {
-    const cb=JSON.stringify({name:'lunari-'+slug});
-    const co={hostname:'api.netlify.com',path:'/api/v1/sites',method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+CONFIG.NETLIFY_TOKEN,'Content-Length':Buffer.byteLength(cb)}};
-    const cr=https.request(co,res=>{let d='';res.on('data',c=>d+=c);res.on('end',()=>{try{
-      const site=JSON.parse(d);
-      if(!site.id)return reject(new Error('Site creation failed: '+d.slice(0,200)));
-      console.log('[BUILD] Site: '+site.id);
-      const hb=Buffer.from(html,'utf8');
-      const sha1=crypto.createHash('sha1').update(hb).digest('hex');
-      const db=JSON.stringify({files:{'/index.html':sha1},draft:false});
-      const dopt={hostname:'api.netlify.com',path:`/api/v1/sites/${site.id}/deploys`,method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+CONFIG.NETLIFY_TOKEN,'Content-Length':Buffer.byteLength(db)}};
-      const dr=https.request(dopt,dres=>{let dd='';dres.on('data',c=>dd+=c);dres.on('end',()=>{try{
-        const deploy=JSON.parse(dd);
-        if(!deploy.id)return reject(new Error('Deploy failed: '+dd.slice(0,200)));
-        console.log('[BUILD] Deploy: '+deploy.id);
-        const uo={hostname:'api.netlify.com',path:`/api/v1/deploys/${deploy.id}/files/index.html`,method:'PUT',headers:{'Content-Type':'application/octet-stream','Authorization':'Bearer '+CONFIG.NETLIFY_TOKEN,'Content-Length':hb.length}};
-        const ur=https.request(uo,ures=>{ures.on('data',()=>{});ures.on('end',()=>{const url=site.ssl_url||site.url||`https://lunari-${slug}.netlify.app`;console.log('[BUILD] Live: '+url);resolve({url,siteId:site.id});});});
-        ur.on('error',reject);ur.write(hb);ur.end();
-      }catch(e){reject(e);}});});
-      dr.on('error',reject);dr.write(db);dr.end();
-    }catch(e){reject(e);}});});
-    cr.on('error',reject);cr.write(cb);cr.end();
+    // Use Netlify's zip-based deploy for reliability
+    const zlib = require('zlib');
+    
+    // Create a minimal zip file containing index.html
+    // Using Netlify's simpler form-based deploy endpoint
+    const siteName = 'lunari-' + slug;
+    
+    // Step 1: Create site
+    const cb = JSON.stringify({ name: siteName });
+    const co = {
+      hostname:'api.netlify.com', path:'/api/v1/sites', method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+CONFIG.NETLIFY_TOKEN,'Content-Length':Buffer.byteLength(cb)}
+    };
+    
+    const cr = https.request(co, res => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => {
+        try {
+          const site = JSON.parse(d);
+          if (!site.id) return reject(new Error('Site creation failed: ' + d.slice(0,300)));
+          console.log('[BUILD] Site created: ' + site.id + ' url: ' + (site.ssl_url||site.url));
+          
+          // Step 2: Deploy using files API with correct content
+          const htmlBuf = Buffer.from(html, 'utf8');
+          const sha1 = crypto.createHash('sha1').update(htmlBuf).digest('hex');
+          
+          console.log('[BUILD] HTML size: ' + htmlBuf.length + ' bytes, sha1: ' + sha1);
+          
+          const deployPayload = JSON.stringify({
+            files: { '/index.html': sha1 },
+            draft: false,
+            branch: 'main'
+          });
+          
+          const dopt = {
+            hostname:'api.netlify.com',
+            path:`/api/v1/sites/${site.id}/deploys`,
+            method:'POST',
+            headers:{
+              'Content-Type':'application/json',
+              'Authorization':'Bearer '+CONFIG.NETLIFY_TOKEN,
+              'Content-Length':Buffer.byteLength(deployPayload)
+            }
+          };
+          
+          const dr = https.request(dopt, dres => {
+            let dd = '';
+            dres.on('data', c => dd += c);
+            dres.on('end', () => {
+              try {
+                const deploy = JSON.parse(dd);
+                if (!deploy.id) return reject(new Error('Deploy creation failed: ' + dd.slice(0,300)));
+                console.log('[BUILD] Deploy created: ' + deploy.id + ' required: ' + JSON.stringify(deploy.required));
+                
+                // Step 3: Upload the file
+                const uo = {
+                  hostname:'api.netlify.com',
+                  path:`/api/v1/deploys/${deploy.id}/files/index.html`,
+                  method:'PUT',
+                  headers:{
+                    'Content-Type':'text/html; charset=utf-8',
+                    'Authorization':'Bearer '+CONFIG.NETLIFY_TOKEN,
+                    'Content-Length':htmlBuf.length
+                  }
+                };
+                
+                const ur = https.request(uo, ures => {
+                  let ud = '';
+                  ures.on('data', c => ud += c);
+                  ures.on('end', () => {
+                    console.log('[BUILD] Upload status: ' + ures.statusCode + ' response: ' + ud.slice(0,100));
+                    const finalUrl = site.ssl_url || site.url || ('https://' + siteName + '.netlify.app');
+                    console.log('[BUILD] Final URL: ' + finalUrl);
+                    resolve({ url: finalUrl, siteId: site.id });
+                  });
+                });
+                
+                ur.on('error', e => {
+                  console.error('[BUILD] Upload error:', e.message);
+                  reject(e);
+                });
+                ur.write(htmlBuf);
+                ur.end();
+                
+              } catch(e) { reject(e); }
+            });
+          });
+          dr.on('error', reject);
+          dr.write(deployPayload);
+          dr.end();
+          
+        } catch(e) { reject(e); }
+      });
+    });
+    cr.on('error', reject);
+    cr.write(cb);
+    cr.end();
   });
 }
 
