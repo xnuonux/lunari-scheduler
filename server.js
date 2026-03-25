@@ -8,6 +8,7 @@ const CONFIG = {
   NETLIFY_TOKEN:         process.env.NETLIFY_API_TOKEN        || '',
   SUPABASE_URL:          process.env.SUPABASE_URL             || '',
   SUPABASE_KEY:          process.env.SUPABASE_KEY             || '',
+  SUPABASE_SERVICE_KEY:  process.env.SUPABASE_SERVICE_KEY     || '',
   STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET    || '',
   EMAILJS_SERVICE:       process.env.EMAILJS_SERVICE_ID       || 'service_3d0r898',
   EMAILJS_TEMPLATE:      process.env.EMAILJS_TEMPLATE_ID      || 'template_j4ecn66',
@@ -727,6 +728,72 @@ async function saveToGoogleDocs(userId, title, content, category) {
         res.writeHead(200); res.end(JSON.stringify(result));
       } catch(e) { res.writeHead(500); res.end(JSON.stringify({ error: e.message })); }
     }); return;
+  }
+
+  // ── ADMIN ─────────────────────────────────────────
+  if(req.method==='GET'&&url.startsWith('/admin/users')){
+    const params = new URLSearchParams(req.url.split('?')[1]||'');
+    const adminKey = params.get('key')||'';
+    // Verify admin by checking if key matches service key prefix
+    if (!CONFIG.SUPABASE_SERVICE_KEY) {
+      res.writeHead(403); return res.end(JSON.stringify({ error: 'No service key configured' }));
+    }
+
+    // Fetch users using service role key
+    const serviceKey = CONFIG.SUPABASE_SERVICE_KEY;
+    const u = new URL(CONFIG.SUPABASE_URL);
+    const opts = {
+      hostname: u.hostname,
+      path: '/auth/v1/admin/users?page=1&per_page=50',
+      method: 'GET',
+      headers: {
+        'apikey': serviceKey,
+        'Authorization': 'Bearer ' + serviceKey,
+        'Content-Type': 'application/json'
+      }
+    };
+    const authReq = https.request(opts, authRes => {
+      let d = ''; authRes.on('data', c => d += c);
+      authRes.on('end', async () => {
+        try {
+          const data = JSON.parse(d);
+          const users = data.users || [];
+
+          // Get credit data for all users
+          const credits = await sbFetch('GET', 'user_credits?select=user_id,credits,plan,total_used,sites_built&limit=100').catch(() => []);
+          const creditMap = {};
+          if (Array.isArray(credits)) credits.forEach(c => { creditMap[c.user_id] = c; });
+
+          const enriched = users.map(u => ({
+            id: u.id,
+            email: u.email,
+            created_at: u.created_at,
+            last_sign_in_at: u.last_sign_in_at,
+            plan: (creditMap[u.id] && creditMap[u.id].plan) || 'free',
+            credits: (creditMap[u.id] && creditMap[u.id].credits) || 0,
+            total_used: (creditMap[u.id] && creditMap[u.id].total_used) || 0,
+            sites_built: (creditMap[u.id] && creditMap[u.id].sites_built) || 0,
+          }));
+
+          const paying = enriched.filter(u => u.plan && u.plan !== 'free').length;
+          const weekAgo = new Date(Date.now() - 7*24*60*60*1000).toISOString();
+          const active = enriched.filter(u => u.last_sign_in_at && u.last_sign_in_at > weekAgo).length;
+
+          res.writeHead(200);
+          res.end(JSON.stringify({
+            total: users.length,
+            active_week: active,
+            paying: paying,
+            users: enriched
+          }));
+        } catch(e) {
+          res.writeHead(500); res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+    });
+    authReq.on('error', e => { res.writeHead(500); res.end(JSON.stringify({ error: e.message })); });
+    authReq.end();
+    return;
   }
 
   // ── STRIPE WEBHOOK ───────────────────────────────
