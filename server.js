@@ -370,7 +370,7 @@ const GMAIL = {
   CLIENT_ID:     process.env.GMAIL_CLIENT_ID     || '',
   CLIENT_SECRET: process.env.GMAIL_CLIENT_SECRET || '',
   REDIRECT_URI:  'https://nodejs-production-63513.up.railway.app/auth/gmail/callback',
-  SCOPE:         'https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/userinfo.email',
+  SCOPE:         'https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/documents',
 };
 
 const TWITTER = {
@@ -639,6 +639,95 @@ async function sendGmail(userId, to, subject, body) {
     });return;
   }
 
+
+async function createLunariFolder(accessToken) {
+  // Check if LUNARI folder exists
+  const search = await gmailRequest(
+    '/drive/v3/files?q=name%3D\'LUNARI\'%20and%20mimeType%3D\'application%2Fvnd.google-apps.folder\'%20and%20trashed%3Dfalse&fields=files(id,name)',
+    'GET', null, accessToken
+  );
+  if (search.data && search.data.files && search.data.files.length > 0) {
+    return search.data.files[0].id;
+  }
+  // Create it
+  const folder = await gmailRequest('/drive/v3/files', 'POST', {
+    name: 'LUNARI',
+    mimeType: 'application/vnd.google-apps.folder'
+  }, accessToken);
+  return folder.data.id;
+}
+
+async function createSubFolder(accessToken, parentId, name) {
+  const search = await gmailRequest(
+    `/drive/v3/files?q=name%3D'${encodeURIComponent(name)}'%20and%20mimeType%3D'application%2Fvnd.google-apps.folder'%20and%20'${parentId}'%20in%20parents%20and%20trashed%3Dfalse&fields=files(id,name)`,
+    'GET', null, accessToken
+  );
+  if (search.data && search.data.files && search.data.files.length > 0) {
+    return search.data.files[0].id;
+  }
+  const folder = await gmailRequest('/drive/v3/files', 'POST', {
+    name: name,
+    mimeType: 'application/vnd.google-apps.folder',
+    parents: [parentId]
+  }, accessToken);
+  return folder.data.id;
+}
+
+async function saveToGoogleDocs(userId, title, content, category) {
+  const token = await getGmailToken(userId);
+  if (!token) return { ok: false, error: 'not_connected' };
+
+  try {
+    // Get or create LUNARI folder structure
+    const lunariId = await createLunariFolder(token);
+    const folderMap = { research: 'Research', content: 'Content', strategy: 'Strategy', sites: 'Sites', general: 'General' };
+    const folderName = folderMap[category] || 'General';
+    const subFolderId = await createSubFolder(token, lunariId, folderName);
+
+    // Create Google Doc
+    const docDate = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    const docTitle = title + ' — ' + docDate;
+
+    const createRes = await gmailRequest('/drive/v3/files', 'POST', {
+      name: docTitle,
+      mimeType: 'application/vnd.google-apps.document',
+      parents: [subFolderId]
+    }, token);
+
+    if (!createRes.data || !createRes.data.id) return { ok: false, error: 'Could not create doc' };
+    const docId = createRes.data.id;
+
+    // Write content to doc
+    const requests = [{
+      insertText: {
+        location: { index: 1 },
+        text: content.replace(/\*\*/g, '').replace(/\*/g, '').replace(/#+\s/g, '')
+      }
+    }];
+
+    await gmailRequest(`/docs/v1/documents/${docId}:batchUpdate`, 'POST', { requests }, token);
+
+    const docUrl = 'https://docs.google.com/document/d/' + docId + '/edit';
+    console.log('[DRIVE] Saved:', docTitle, docUrl);
+    return { ok: true, url: docUrl, title: docTitle };
+  } catch(e) {
+    console.error('[DRIVE] Error:', e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
+  // ── GOOGLE DRIVE SAVE ────────────────────────────
+  if(req.method==='POST'&&url==='/drive/save'){
+    let b=''; req.on('data', c => b += c);
+    req.on('end', async () => {
+      try {
+        const { userId, title, content, category } = JSON.parse(b);
+        if (!userId || !title || !content) { res.writeHead(400); return res.end(JSON.stringify({ error: 'Missing fields' })); }
+        const result = await saveToGoogleDocs(userId, title, content, category || 'general');
+        res.writeHead(200); res.end(JSON.stringify(result));
+      } catch(e) { res.writeHead(500); res.end(JSON.stringify({ error: e.message })); }
+    }); return;
+  }
 
   // ── STRIPE WEBHOOK ───────────────────────────────
   if(req.method==='POST'&&url==='/webhooks/stripe'){
