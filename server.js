@@ -303,6 +303,16 @@ async function executeBuild(task,userId,siteName,jobId) {
     await incrementSiteCount(userId);
     BUILD_RESULTS[jobId]={status:'done',url:result.url,siteId:result.siteId,message:'Live at '+result.url,userId,builtAt:new Date().toISOString()};
 
+    // Log build to Supabase
+    await sbFetch('POST', 'site_builds', {
+      user_id: userId,
+      url: result.url,
+      netlify_id: result.siteId,
+      task: task.slice(0, 200),
+      site_name: siteName || '',
+      built_at: new Date().toISOString()
+    }).catch(() => {});
+
     // Auto-tweet from @LunariPro
     postLunariBuildTweet(result.url, siteName || task.slice(0,40), null);
 
@@ -779,12 +789,16 @@ async function saveToGoogleDocs(userId, title, content, category) {
           const weekAgo = new Date(Date.now() - 7*24*60*60*1000).toISOString();
           const active = enriched.filter(u => u.last_sign_in_at && u.last_sign_in_at > weekAgo).length;
 
+          // Get sites log
+          const sites = await sbFetch('GET', 'site_builds?select=url,task,site_name,built_at,user_id&order=built_at.desc&limit=50').catch(() => []);
+
           res.writeHead(200);
           res.end(JSON.stringify({
             total: users.length,
             active_week: active,
             paying: paying,
-            users: enriched
+            users: enriched,
+            sites: Array.isArray(sites) ? sites : []
           }));
         } catch(e) {
           res.writeHead(500); res.end(JSON.stringify({ error: e.message }));
