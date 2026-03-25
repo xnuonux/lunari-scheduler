@@ -368,6 +368,18 @@ const GMAIL = {
   SCOPE:         'https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/userinfo.email',
 };
 
+const TWITTER = {
+  CLIENT_ID:     process.env.TWITTER_CLIENT_ID     || '',
+  CLIENT_SECRET: process.env.TWITTER_CLIENT_SECRET || '',
+  API_KEY:       process.env.TWITTER_API_KEY        || '',
+  API_SECRET:    process.env.TWITTER_API_SECRET     || '',
+  REDIRECT_URI:  'https://nodejs-production-63513.up.railway.app/auth/twitter/callback',
+  SCOPE:         'tweet.read tweet.write users.read offline.access',
+};
+
+const TWITTER_TOKENS = {};
+const TWITTER_STATES = {}; // PKCE state store
+
 // In-memory token store (keyed by userId) — backed by Supabase
 const GMAIL_TOKENS = {};
 
@@ -574,6 +586,82 @@ async function sendGmail(userId, to, subject, body) {
         const result = await sendGmail(userId, to, subject, body);
         res.writeHead(200);res.end(JSON.stringify(result));
       }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
+    });return;
+  }
+
+
+  // ── TWITTER OAUTH ─────────────────────────────────
+
+  if(req.method==='GET'&&url.startsWith('/auth/twitter/connect')){
+    const params=new URLSearchParams(req.url.split('?')[1]||'');
+    const userId=params.get('userId')||'';
+    const verifier=crypto.randomBytes(32).toString('base64url');
+    const challenge=crypto.createHash('sha256').update(verifier).digest('base64url');
+    const state=crypto.randomBytes(16).toString('hex');
+    TWITTER_STATES[state]={verifier,userId,expires:Date.now()+600000};
+    const authUrl='https://twitter.com/i/oauth2/authorize?response_type=code&client_id='+encodeURIComponent(TWITTER.CLIENT_ID)+'&redirect_uri='+encodeURIComponent(TWITTER.REDIRECT_URI)+'&scope='+encodeURIComponent(TWITTER.SCOPE)+'&state='+state+'&code_challenge='+challenge+'&code_challenge_method=S256';
+    res.writeHead(200);return res.end(JSON.stringify({url:authUrl}));
+  }
+
+  if(req.method==='GET'&&url.startsWith('/auth/twitter/callback')){
+    const params=new URLSearchParams(req.url.split('?')[1]||'');
+    const code=params.get('code');const state=params.get('state');
+    if(!code||!state||!TWITTER_STATES[state]){res.writeHead(400);return res.end('<html><body style="background:#08090e;color:#dce3f0;font-family:sans-serif;padding:40px;"><h2>Auth failed</h2></body></html>');}
+    const{verifier,userId}=TWITTER_STATES[state];delete TWITTER_STATES[state];
+    const tokenBody=new URLSearchParams({code,grant_type:'authorization_code',client_id:TWITTER.CLIENT_ID,redirect_uri:TWITTER.REDIRECT_URI,code_verifier:verifier}).toString();
+    const credentials=Buffer.from(TWITTER.CLIENT_ID+':'+TWITTER.CLIENT_SECRET).toString('base64');
+    const tokenOpts={hostname:'api.twitter.com',path:'/2/oauth2/token',method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','Authorization':'Basic '+credentials,'Content-Length':Buffer.byteLength(tokenBody)}};
+    const tokenReq=https.request(tokenOpts,tokenRes=>{let d='';tokenRes.on('data',c=>d+=c);tokenRes.on('end',async()=>{
+      try{
+        const tokens=JSON.parse(d);
+        if(!tokens.access_token){res.writeHead(400);return res.end('<html><body style="background:#08090e;color:#dce3f0;padding:40px;"><h2>Auth failed</h2><pre>'+d+'</pre></body></html>');}
+        const expiresAt=Date.now()+(tokens.expires_in||7200)*1000;
+        const userOpts={hostname:'api.twitter.com',path:'/2/users/me',method:'GET',headers:{'Authorization':'Bearer '+tokens.access_token}};
+        const userInfo=await new Promise(resolve=>{const r=https.request(userOpts,rs=>{let dd='';rs.on('data',c=>dd+=c);rs.on('end',()=>{try{resolve(JSON.parse(dd));}catch(e){resolve({});}});});r.on('error',()=>resolve({}));r.end();});
+        const username=(userInfo.data&&userInfo.data.username)||'';
+        const name=(userInfo.data&&userInfo.data.name)||'';
+        TWITTER_TOKENS[userId]={access_token:tokens.access_token,refresh_token:tokens.refresh_token||'',expires_at:expiresAt,username,name};
+        await sbFetch('POST','twitter_tokens',{user_id:userId,access_token:tokens.access_token,refresh_token:tokens.refresh_token||'',expires_at:expiresAt,username,name}).catch(()=>{});
+        res.writeHead(200,{'Content-Type':'text/html'});
+        res.end('<html><head><script>window.opener&&window.opener.postMessage({type:"twitter_connected",username:"'+username+'"},"*");setTimeout(()=>window.close(),1000);</script></head><body style="background:#08090e;color:#dce3f0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;"><h2 style="color:#c9a84c;">X connected ✓</h2></body></html>');
+      }catch(e){res.writeHead(500);res.end('<html><body><h2>Error: '+e.message+'</h2></body></html>');}
+    });});tokenReq.on('error',e=>{res.writeHead(500);res.end(e.message);});tokenReq.write(tokenBody);tokenReq.end();return;
+  }
+
+  if(req.method==='GET'&&url.startsWith('/auth/twitter/status')){
+    const params=new URLSearchParams(req.url.split('?')[1]||'');
+    const userId=params.get('userId')||'';
+    (async()=>{
+      let td=TWITTER_TOKENS[userId];
+      if(!td){const rows=await sbFetch('GET',`twitter_tokens?user_id=eq.${userId}&select=access_token,refresh_token,expires_at,username,name&limit=1`).catch(()=>null);if(rows&&rows[0]){td=rows[0];TWITTER_TOKENS[userId]=rows[0];}}
+      res.writeHead(200);res.end(JSON.stringify({connected:!!(td&&td.access_token),username:(td&&td.username)||'',name:(td&&td.name)||''}));
+    })();return;
+  }
+
+  if(req.method==='POST'&&url==='/auth/twitter/disconnect'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try{const{userId}=JSON.parse(b);delete TWITTER_TOKENS[userId];await sbFetch('DELETE',`twitter_tokens?user_id=eq.${userId}`).catch(()=>{});res.writeHead(200);res.end(JSON.stringify({ok:true}));}
+      catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}
+    });return;
+  }
+
+  if(req.method==='POST'&&url==='/twitter/tweet'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try{
+        const{userId,text}=JSON.parse(b);
+        if(!userId||!text){res.writeHead(400);return res.end(JSON.stringify({error:'Missing fields'}));}
+        let td=TWITTER_TOKENS[userId];
+        if(!td){const rows=await sbFetch('GET',`twitter_tokens?user_id=eq.${userId}&select=access_token,refresh_token,expires_at,username&limit=1`).catch(()=>null);if(rows&&rows[0]){td=rows[0];TWITTER_TOKENS[userId]=rows[0];}}
+        if(!td||!td.access_token){res.writeHead(200);return res.end(JSON.stringify({ok:false,error:'not_connected'}));}
+        const tweetBody=JSON.stringify({text:text.slice(0,280)});
+        const tweetOpts={hostname:'api.twitter.com',path:'/2/tweets',method:'POST',headers:{'Authorization':'Bearer '+td.access_token,'Content-Type':'application/json','Content-Length':Buffer.byteLength(tweetBody)}};
+        const tweetReq=https.request(tweetOpts,tweetRes=>{let dd='';tweetRes.on('data',c=>dd+=c);tweetRes.on('end',()=>{
+          try{const result=JSON.parse(dd);console.log('[TWITTER] status:',tweetRes.statusCode);
+          if(tweetRes.statusCode===201&&result.data){res.writeHead(200);res.end(JSON.stringify({ok:true,id:result.data.id,url:'https://twitter.com/'+(td.username||'i')+'/status/'+result.data.id}));}
+          else{res.writeHead(200);res.end(JSON.stringify({ok:false,error:JSON.stringify(result).slice(0,100)}));}}
+          catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
+        });});tweetReq.on('error',e=>{res.writeHead(500);res.end(JSON.stringify({error:e.message}));});tweetReq.write(tweetBody);tweetReq.end();
+      }catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}
     });return;
   }
 
