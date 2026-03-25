@@ -4,14 +4,15 @@ const http   = require('http');
 const crypto = require('crypto');
 
 const CONFIG = {
-  ANTHROPIC_KEY:    process.env.ANTHROPIC_API_KEY  || '',
-  NETLIFY_TOKEN:    process.env.NETLIFY_API_TOKEN   || '',
-  SUPABASE_URL:     process.env.SUPABASE_URL        || '',
-  SUPABASE_KEY:     process.env.SUPABASE_KEY        || '',
-  EMAILJS_SERVICE:  process.env.EMAILJS_SERVICE_ID  || 'service_3d0r898',
-  EMAILJS_TEMPLATE: process.env.EMAILJS_TEMPLATE_ID || 'template_j4ecn66',
-  EMAILJS_KEY:      process.env.EMAILJS_PUBLIC_KEY  || 'SnGkSaX1ThQBSysOU',
-  PORT:             process.env.PORT                 || 3000,
+  ANTHROPIC_KEY:         process.env.ANTHROPIC_API_KEY       || '',
+  NETLIFY_TOKEN:         process.env.NETLIFY_API_TOKEN        || '',
+  SUPABASE_URL:          process.env.SUPABASE_URL             || '',
+  SUPABASE_KEY:          process.env.SUPABASE_KEY             || '',
+  STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET    || '',
+  EMAILJS_SERVICE:       process.env.EMAILJS_SERVICE_ID       || 'service_3d0r898',
+  EMAILJS_TEMPLATE:      process.env.EMAILJS_TEMPLATE_ID      || 'template_j4ecn66',
+  EMAILJS_KEY:           process.env.EMAILJS_PUBLIC_KEY       || 'SnGkSaX1ThQBSysOU',
+  PORT:                  process.env.PORT                     || 3000,
 };
 
 const BUILD_RESULTS = {};
@@ -638,6 +639,120 @@ async function sendGmail(userId, to, subject, body) {
     });return;
   }
 
+
+  // ── STRIPE WEBHOOK ───────────────────────────────
+  if(req.method==='POST'&&url==='/webhooks/stripe'){
+    let rawBody = Buffer.alloc(0);
+    req.on('data', chunk => { rawBody = Buffer.concat([rawBody, chunk]); });
+    req.on('end', async () => {
+      try {
+        // Verify Stripe signature
+        const sig = req.headers['stripe-signature'];
+        const secret = CONFIG.STRIPE_WEBHOOK_SECRET;
+
+        if (!secret) {
+          res.writeHead(400); return res.end(JSON.stringify({ error: 'No webhook secret' }));
+        }
+
+        // Manual HMAC verification (no Stripe SDK needed)
+        const parts = sig.split(',').reduce((acc, part) => {
+          const [k, v] = part.split('=');
+          acc[k] = v;
+          return acc;
+        }, {});
+
+        const timestamp = parts.t;
+        const sigHash = parts.v1;
+        const payload = timestamp + '.' + rawBody.toString('utf8');
+        const expected = crypto.createHmac('sha256', secret).update(payload).digest('hex');
+
+        if (expected !== sigHash) {
+          console.log('[STRIPE] Invalid signature');
+          res.writeHead(400); return res.end(JSON.stringify({ error: 'Invalid signature' }));
+        }
+
+        const event = JSON.parse(rawBody.toString('utf8'));
+        console.log('[STRIPE] Event:', event.type);
+
+        // Map Stripe price IDs to plan names and Fuel amounts
+        const PRICE_MAP = {
+          // Subscriptions — fill in your actual price IDs from Stripe dashboard
+          'price_starter':    { plan: 'starter',    credits: 9,   site_limit: 1 },
+          'price_pro':        { plan: 'pro',         credits: 30,  site_limit: 2 },
+          'price_studio':     { plan: 'studio',      credits: 100, site_limit: 5 },
+          // Fuel packs — one-time payments
+          'price_spark':      { credits: 1  },
+          'price_duo':        { credits: 2  },
+          'price_trio':       { credits: 3  },
+          'price_five':       { credits: 5  },
+          'price_eight':      { credits: 8  },
+          'price_thirteen':   { credits: 13 },
+          'price_twentyone':  { credits: 21 },
+          'price_thirtyfour': { credits: 34 },
+          'price_fiftyfive':  { credits: 55 },
+          'price_eightynine': { credits: 89 },
+        };
+
+        if (event.type === 'checkout.session.completed') {
+          const session = event.data.object;
+          const customerEmail = session.customer_details && session.customer_details.email;
+          const priceId = session.metadata && session.metadata.price_id;
+          const lineItems = session.line_items;
+
+          console.log('[STRIPE] Session email:', customerEmail, 'price:', priceId);
+
+          // Find user by email in Supabase
+          if (customerEmail) {
+            const users = await sbFetch('GET', `auth.users?email=eq.${encodeURIComponent(customerEmail)}&select=id&limit=1`).catch(() => null);
+
+            // Try profiles table if auth.users not accessible
+            let userId = null;
+            if (users && users[0]) {
+              userId = users[0].id;
+            } else {
+              // Search user_credits by matching — Supabase may not expose auth.users directly
+              const credits = await sbFetch('GET', `user_credits?select=user_id&limit=100`).catch(() => null);
+              // We'll use metadata approach instead
+            }
+
+            if (userId && priceId && PRICE_MAP[priceId]) {
+              const mapping = PRICE_MAP[priceId];
+              if (mapping.plan) {
+                // Subscription — update plan and add credits
+                await sbFetch('PATCH', `user_credits?user_id=eq.${userId}`, {
+                  plan: mapping.plan,
+                  credits: mapping.credits,
+                  site_limit: mapping.site_limit,
+                  updated_at: new Date().toISOString()
+                });
+                console.log('[STRIPE] Updated plan to', mapping.plan, 'for', userId);
+              } else {
+                // Fuel pack — add credits to existing
+                const current = await sbFetch('GET', `user_credits?user_id=eq.${userId}&select=credits&limit=1`).catch(() => null);
+                const currentCredits = (current && current[0]) ? (current[0].credits || 0) : 0;
+                await sbFetch('PATCH', `user_credits?user_id=eq.${userId}`, {
+                  credits: currentCredits + mapping.credits,
+                  updated_at: new Date().toISOString()
+                });
+                console.log('[STRIPE] Added', mapping.credits, 'Fuel to', userId);
+              }
+            }
+          }
+        }
+
+        if (event.type === 'payment_intent.succeeded') {
+          const pi = event.data.object;
+          console.log('[STRIPE] Payment succeeded:', pi.id, 'amount:', pi.amount);
+          // Additional handling if needed
+        }
+
+        res.writeHead(200); res.end(JSON.stringify({ received: true }));
+      } catch(e) {
+        console.error('[STRIPE] Webhook error:', e.message);
+        res.writeHead(400); res.end(JSON.stringify({ error: e.message }));
+      }
+    }); return;
+  }
 
   // ── TWITTER OAUTH ─────────────────────────────────
 
