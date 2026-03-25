@@ -543,6 +543,61 @@ async function sendGmail(userId, to, subject, body) {
 
   if(req.method==='POST'&&url==='/proxy/claude'){let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{const pl=JSON.parse(b);const apiKey=pl.apiKey||CONFIG.ANTHROPIC_KEY;const rb=pl.body;if(!apiKey||!rb){res.writeHead(400);return res.end(JSON.stringify({error:'Missing fields'}));}const bs=JSON.stringify(rb);const o={hostname:'api.anthropic.com',path:'/v1/messages',method:'POST',headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','anthropic-beta':'web-search-2025-03-05','Content-Length':Buffer.byteLength(bs)}};const pr=https.request(o,pres=>{let d='';pres.on('data',c=>d+=c);pres.on('end',()=>{res.writeHead(pres.statusCode,{'Content-Type':'application/json'});res.end(d);});});pr.on('error',e=>{res.writeHead(500);res.end(JSON.stringify({error:e.message}));});pr.write(bs);pr.end();}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
 
+  // ── STREAMING PROXY ───────────────────────────────
+  if(req.method==='POST'&&url==='/proxy/stream'){
+    let b=''; req.on('data',c=>b+=c);
+    req.on('end',()=>{
+      try {
+        const pl = JSON.parse(b);
+        const apiKey = pl.apiKey || CONFIG.ANTHROPIC_KEY;
+        const rb = pl.body;
+        if(!apiKey||!rb){ res.writeHead(400); return res.end('data: {"error":"Missing fields"}\n\n'); }
+
+        // Force stream mode
+        rb.stream = true;
+
+        const bs = JSON.stringify(rb);
+        const o = {
+          hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+            'anthropic-beta': 'web-search-2025-03-05',
+            'Content-Length': Buffer.byteLength(bs)
+          }
+        };
+
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          'Access-Control-Allow-Origin': '*'
+        });
+
+        const pr = https.request(o, pres => {
+          pres.on('data', chunk => {
+            // Forward SSE chunks directly to client
+            res.write(chunk);
+          });
+          pres.on('end', () => {
+            res.write('data: [DONE]\n\n');
+            res.end();
+          });
+        });
+        pr.on('error', e => {
+          res.write('data: {"error":"' + e.message + '"}\n\n');
+          res.end();
+        });
+        pr.write(bs);
+        pr.end();
+      } catch(e) {
+        res.write('data: {"error":"' + e.message + '"}\n\n');
+        res.end();
+      }
+    }); return;
+  }
+
   // ── GMAIL OAUTH ───────────────────────────────────
 
   // Step 1: Frontend requests auth URL
