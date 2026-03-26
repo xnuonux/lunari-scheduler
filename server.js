@@ -757,121 +757,6 @@ async function sendMorningBriefs() {
 }
 
 // ── HTTP handler ─────────────────────────────────
-function handleRequest(req,res){
-  res.setHeader('Access-Control-Allow-Origin','*');
-  res.setHeader('Access-Control-Allow-Methods','GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization');
-  res.setHeader('Content-Type','application/json');
-  if(req.method==='OPTIONS'){res.writeHead(204);return res.end();}
-  const url=req.url.split('?')[0];
-
-  if(url==='/'||url==='/health'){res.writeHead(200);return res.end(JSON.stringify({status:'online',service:'LUNARI v4',uptime:Math.floor(process.uptime())+'s',netlify:CONFIG.NETLIFY_TOKEN?'SET':'NOT SET',supabase:CONFIG.SUPABASE_URL?'SET':'NOT SET'}));}
-
-  if(req.method==='POST'&&url==='/execute'){
-    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
-      try{
-        const{task,userId,siteName}=JSON.parse(b);
-        if(!task){res.writeHead(400);return res.end(JSON.stringify({error:'Missing task'}));}
-        if(!CONFIG.ANTHROPIC_KEY){res.writeHead(500);return res.end(JSON.stringify({error:'No API key'}));}
-        if(!CONFIG.NETLIFY_TOKEN){res.writeHead(500);return res.end(JSON.stringify({error:'No Netlify token'}));}
-        const jobId=Date.now().toString();
-        res.writeHead(200);res.end(JSON.stringify({ok:true,jobId,message:'Build started'}));
-        executeBuild(task,userId,siteName,jobId).catch(e=>console.error('[BUILD]',e.message));
-      }catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}
-    });return;
-  }
-
-  if(req.method==='GET'&&url.startsWith('/execute/status/')){
-    const jobId=url.split('/').pop();
-    res.writeHead(200);return res.end(JSON.stringify(BUILD_RESULTS[jobId]||{status:'building',message:'Still working...'}));
-  }
-
-  if(req.method==='GET'&&url==='/schedules'){res.writeHead(200);return res.end(JSON.stringify({schedules:SCHEDULES}));}
-
-  if(req.method==='POST'&&url==='/schedules/update'){let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{const d=JSON.parse(b);const i=SCHEDULES.findIndex(s=>s.id===d.id);if(i>=0){SCHEDULES[i]={...SCHEDULES[i],...d};if(d.schedule)SCHEDULES[i].nextRun=getNextRun(d.schedule);res.writeHead(200);res.end(JSON.stringify({ok:true,schedule:SCHEDULES[i]}));}else{res.writeHead(404);res.end(JSON.stringify({error:'Not found'}));}}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
-
-  // ── TWITTER MANUAL TRIGGERS ──────────────────────
-  if(req.method==='POST'&&url==='/twitter/post-now'){
-    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
-      try{
-        const{type='daily'}=JSON.parse(b||'{}');
-        if(type==='engage') {
-          runTwitterEngagement().catch(e=>console.error('[TWITTER ENGAGE] Trigger error:', e.message));
-        } else {
-          runAutonomousTwitter().catch(e=>console.error('[TWITTER AUTO] Trigger error:', e.message));
-        }
-        res.writeHead(200);res.end(JSON.stringify({ok:true,message:'Twitter post triggered'}));
-      }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
-    });return;
-  }
-
-  // Twitter diagnostic — posts a real test tweet and returns full API response
-  if(req.method==='POST'&&url==='/twitter/test'){
-    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
-      try{
-        const text = 'LUNARI systems check — ' + new Date().toISOString().slice(0,16) + ' 🌙';
-        const body = JSON.stringify({ text });
-        const tweetUrl = 'https://api.twitter.com/2/tweets';
-        const authHeader = oauthSign('POST', tweetUrl, {}, TWITTER.API_KEY, TWITTER.API_SECRET, TWITTER.LUNARI_TOKEN, TWITTER.LUNARI_SECRET);
-        const result = await new Promise((resolve) => {
-          const opts = {
-            hostname: 'api.twitter.com', path: '/2/tweets', method: 'POST',
-            headers: {
-              'Authorization': authHeader,
-              'Content-Type': 'application/json',
-              'Content-Length': Buffer.byteLength(body),
-              'User-Agent': 'LUNARI/1.0'
-            }
-          };
-          const req2 = https.request(opts, r => {
-            let d = ''; r.on('data', c => d += c);
-            r.on('end', () => {
-              let parsed; try { parsed = JSON.parse(d); } catch(e) { parsed = d; }
-              resolve({ status: r.statusCode, headers: r.headers, body: parsed });
-            });
-          });
-          req2.on('error', e => resolve({ status: 0, error: e.message }));
-          req2.write(body); req2.end();
-        });
-        console.log('[TWITTER TEST]', JSON.stringify(result));
-        res.writeHead(200);res.end(JSON.stringify({
-          test: 'twitter_post',
-          tweet_text: text,
-          credentials: {
-            API_KEY: TWITTER.API_KEY ? TWITTER.API_KEY.slice(0,6) + '...' : 'MISSING',
-            API_SECRET: TWITTER.API_SECRET ? 'SET (' + TWITTER.API_SECRET.length + ' chars)' : 'MISSING',
-            LUNARI_TOKEN: TWITTER.LUNARI_TOKEN ? TWITTER.LUNARI_TOKEN.slice(0,6) + '...' : 'MISSING',
-            LUNARI_SECRET: TWITTER.LUNARI_SECRET ? 'SET (' + TWITTER.LUNARI_SECRET.length + ' chars)' : 'MISSING',
-          },
-          result
-        }));
-      }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message,stack:e.stack}));}
-    });return;
-  }
-
-  if(req.method==='GET'&&url==='/twitter/status'){
-    res.writeHead(200);res.end(JSON.stringify({
-      hasApiKey: !!TWITTER.API_KEY,
-      hasApiSecret: !!TWITTER.API_SECRET,
-      hasLunariToken: !!TWITTER.LUNARI_TOKEN,
-      hasLunariSecret: !!TWITTER.LUNARI_SECRET,
-      hasSerper: !!(process.env.SERPER_API_KEY),
-      hasAnthropic: !!CONFIG.ANTHROPIC_KEY,
-      keyLengths: {
-        API_KEY: TWITTER.API_KEY.length,
-        API_SECRET: TWITTER.API_SECRET.length,
-        LUNARI_TOKEN: TWITTER.LUNARI_TOKEN.length,
-        LUNARI_SECRET: TWITTER.LUNARI_SECRET.length
-      }
-    }));return;
-  }
-
-  if(req.method==='POST'&&url==='/schedules/run'){let b='';req.on('data',c=>b+=c);req.on('end',async()=>{try{const{id}=JSON.parse(b);const s=SCHEDULES.find(s=>s.id===id);if(!s){res.writeHead(404);return res.end(JSON.stringify({error:'Not found'}));}runSchedule(s);res.writeHead(200);res.end(JSON.stringify({ok:true}));}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
-
-  if(req.method==='POST'&&url==='/schedules/add'){let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{const d=JSON.parse(b);const s={id:'s'+Date.now(),name:d.name||'New Schedule',agent:d.agent||'raven',prompt:d.prompt||'',schedule:d.schedule||'0 8 * * *',email:d.email||'',enabled:false,lastRun:null,nextRun:getNextRun(d.schedule||'0 8 * * *')};SCHEDULES.push(s);res.writeHead(200);res.end(JSON.stringify({ok:true,schedule:s}));}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
-
-  if(req.method==='POST'&&url==='/schedules/delete'){let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{const{id}=JSON.parse(b);SCHEDULES=SCHEDULES.filter(s=>s.id!==id);res.writeHead(200);res.end(JSON.stringify({ok:true}));}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
-
 const GMAIL = {
   CLIENT_ID:     process.env.GMAIL_CLIENT_ID     || '',
   CLIENT_SECRET: process.env.GMAIL_CLIENT_SECRET || '',
@@ -1040,6 +925,122 @@ async function sendGmail(userId, to, subject, body) {
   if (result.status === 401) return { ok: false, error: 'token_expired' };
   return { ok: false, error: JSON.stringify(result.data).slice(0, 100) };
 }
+
+
+function handleRequest(req,res){
+  res.setHeader('Access-Control-Allow-Origin','*');
+  res.setHeader('Access-Control-Allow-Methods','GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization');
+  res.setHeader('Content-Type','application/json');
+  if(req.method==='OPTIONS'){res.writeHead(204);return res.end();}
+  const url=req.url.split('?')[0];
+
+  if(url==='/'||url==='/health'){res.writeHead(200);return res.end(JSON.stringify({status:'online',service:'LUNARI v4',uptime:Math.floor(process.uptime())+'s',netlify:CONFIG.NETLIFY_TOKEN?'SET':'NOT SET',supabase:CONFIG.SUPABASE_URL?'SET':'NOT SET'}));}
+
+  if(req.method==='POST'&&url==='/execute'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try{
+        const{task,userId,siteName}=JSON.parse(b);
+        if(!task){res.writeHead(400);return res.end(JSON.stringify({error:'Missing task'}));}
+        if(!CONFIG.ANTHROPIC_KEY){res.writeHead(500);return res.end(JSON.stringify({error:'No API key'}));}
+        if(!CONFIG.NETLIFY_TOKEN){res.writeHead(500);return res.end(JSON.stringify({error:'No Netlify token'}));}
+        const jobId=Date.now().toString();
+        res.writeHead(200);res.end(JSON.stringify({ok:true,jobId,message:'Build started'}));
+        executeBuild(task,userId,siteName,jobId).catch(e=>console.error('[BUILD]',e.message));
+      }catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}
+    });return;
+  }
+
+  if(req.method==='GET'&&url.startsWith('/execute/status/')){
+    const jobId=url.split('/').pop();
+    res.writeHead(200);return res.end(JSON.stringify(BUILD_RESULTS[jobId]||{status:'building',message:'Still working...'}));
+  }
+
+  if(req.method==='GET'&&url==='/schedules'){res.writeHead(200);return res.end(JSON.stringify({schedules:SCHEDULES}));}
+
+  if(req.method==='POST'&&url==='/schedules/update'){let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{const d=JSON.parse(b);const i=SCHEDULES.findIndex(s=>s.id===d.id);if(i>=0){SCHEDULES[i]={...SCHEDULES[i],...d};if(d.schedule)SCHEDULES[i].nextRun=getNextRun(d.schedule);res.writeHead(200);res.end(JSON.stringify({ok:true,schedule:SCHEDULES[i]}));}else{res.writeHead(404);res.end(JSON.stringify({error:'Not found'}));}}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
+
+  // ── TWITTER MANUAL TRIGGERS ──────────────────────
+  if(req.method==='POST'&&url==='/twitter/post-now'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try{
+        const{type='daily'}=JSON.parse(b||'{}');
+        if(type==='engage') {
+          runTwitterEngagement().catch(e=>console.error('[TWITTER ENGAGE] Trigger error:', e.message));
+        } else {
+          runAutonomousTwitter().catch(e=>console.error('[TWITTER AUTO] Trigger error:', e.message));
+        }
+        res.writeHead(200);res.end(JSON.stringify({ok:true,message:'Twitter post triggered'}));
+      }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
+    });return;
+  }
+
+  // Twitter diagnostic — posts a real test tweet and returns full API response
+  if(req.method==='POST'&&url==='/twitter/test'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try{
+        const text = 'LUNARI systems check — ' + new Date().toISOString().slice(0,16) + ' 🌙';
+        const body = JSON.stringify({ text });
+        const tweetUrl = 'https://api.twitter.com/2/tweets';
+        const authHeader = oauthSign('POST', tweetUrl, {}, TWITTER.API_KEY, TWITTER.API_SECRET, TWITTER.LUNARI_TOKEN, TWITTER.LUNARI_SECRET);
+        const result = await new Promise((resolve) => {
+          const opts = {
+            hostname: 'api.twitter.com', path: '/2/tweets', method: 'POST',
+            headers: {
+              'Authorization': authHeader,
+              'Content-Type': 'application/json',
+              'Content-Length': Buffer.byteLength(body),
+              'User-Agent': 'LUNARI/1.0'
+            }
+          };
+          const req2 = https.request(opts, r => {
+            let d = ''; r.on('data', c => d += c);
+            r.on('end', () => {
+              let parsed; try { parsed = JSON.parse(d); } catch(e) { parsed = d; }
+              resolve({ status: r.statusCode, headers: r.headers, body: parsed });
+            });
+          });
+          req2.on('error', e => resolve({ status: 0, error: e.message }));
+          req2.write(body); req2.end();
+        });
+        console.log('[TWITTER TEST]', JSON.stringify(result));
+        res.writeHead(200);res.end(JSON.stringify({
+          test: 'twitter_post',
+          tweet_text: text,
+          credentials: {
+            API_KEY: TWITTER.API_KEY ? TWITTER.API_KEY.slice(0,6) + '...' : 'MISSING',
+            API_SECRET: TWITTER.API_SECRET ? 'SET (' + TWITTER.API_SECRET.length + ' chars)' : 'MISSING',
+            LUNARI_TOKEN: TWITTER.LUNARI_TOKEN ? TWITTER.LUNARI_TOKEN.slice(0,6) + '...' : 'MISSING',
+            LUNARI_SECRET: TWITTER.LUNARI_SECRET ? 'SET (' + TWITTER.LUNARI_SECRET.length + ' chars)' : 'MISSING',
+          },
+          result
+        }));
+      }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message,stack:e.stack}));}
+    });return;
+  }
+
+  if(req.method==='GET'&&url==='/twitter/status'){
+    res.writeHead(200);res.end(JSON.stringify({
+      hasApiKey: !!TWITTER.API_KEY,
+      hasApiSecret: !!TWITTER.API_SECRET,
+      hasLunariToken: !!TWITTER.LUNARI_TOKEN,
+      hasLunariSecret: !!TWITTER.LUNARI_SECRET,
+      hasSerper: !!(process.env.SERPER_API_KEY),
+      hasAnthropic: !!CONFIG.ANTHROPIC_KEY,
+      keyLengths: {
+        API_KEY: TWITTER.API_KEY.length,
+        API_SECRET: TWITTER.API_SECRET.length,
+        LUNARI_TOKEN: TWITTER.LUNARI_TOKEN.length,
+        LUNARI_SECRET: TWITTER.LUNARI_SECRET.length
+      }
+    }));return;
+  }
+
+  if(req.method==='POST'&&url==='/schedules/run'){let b='';req.on('data',c=>b+=c);req.on('end',async()=>{try{const{id}=JSON.parse(b);const s=SCHEDULES.find(s=>s.id===id);if(!s){res.writeHead(404);return res.end(JSON.stringify({error:'Not found'}));}runSchedule(s);res.writeHead(200);res.end(JSON.stringify({ok:true}));}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
+
+  if(req.method==='POST'&&url==='/schedules/add'){let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{const d=JSON.parse(b);const s={id:'s'+Date.now(),name:d.name||'New Schedule',agent:d.agent||'raven',prompt:d.prompt||'',schedule:d.schedule||'0 8 * * *',email:d.email||'',enabled:false,lastRun:null,nextRun:getNextRun(d.schedule||'0 8 * * *')};SCHEDULES.push(s);res.writeHead(200);res.end(JSON.stringify({ok:true,schedule:s}));}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
+
+  if(req.method==='POST'&&url==='/schedules/delete'){let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{const{id}=JSON.parse(b);SCHEDULES=SCHEDULES.filter(s=>s.id!==id);res.writeHead(200);res.end(JSON.stringify({ok:true}));}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
 
   if(req.method==='POST'&&url==='/proxy/claude'){let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{const pl=JSON.parse(b);const apiKey=pl.apiKey||CONFIG.ANTHROPIC_KEY;const rb=pl.body;if(!apiKey||!rb){res.writeHead(400);return res.end(JSON.stringify({error:'Missing fields'}));}const bs=JSON.stringify(rb);const o={hostname:'api.anthropic.com',path:'/v1/messages',method:'POST',headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','anthropic-beta':'web-search-2025-03-05','Content-Length':Buffer.byteLength(bs)}};const pr=https.request(o,pres=>{let d='';pres.on('data',c=>d+=c);pres.on('end',()=>{res.writeHead(pres.statusCode,{'Content-Type':'application/json'});res.end(d);});});pr.on('error',e=>{res.writeHead(500);res.end(JSON.stringify({error:e.message}));});pr.write(bs);pr.end();}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
 
