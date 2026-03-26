@@ -763,6 +763,30 @@ function handleRequest(req,res){
 
   if(req.method==='POST'&&url==='/schedules/update'){let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{const d=JSON.parse(b);const i=SCHEDULES.findIndex(s=>s.id===d.id);if(i>=0){SCHEDULES[i]={...SCHEDULES[i],...d};if(d.schedule)SCHEDULES[i].nextRun=getNextRun(d.schedule);res.writeHead(200);res.end(JSON.stringify({ok:true,schedule:SCHEDULES[i]}));}else{res.writeHead(404);res.end(JSON.stringify({error:'Not found'}));}}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
 
+  // ── TWITTER MANUAL TRIGGERS ──────────────────────
+  if(req.method==='POST'&&url==='/twitter/post-now'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try{
+        const{type='daily'}=JSON.parse(b||'{}');
+        if(type==='engage') {
+          runTwitterEngagement().catch(()=>{});
+        } else {
+          runAutonomousTwitter().catch(()=>{});
+        }
+        res.writeHead(200);res.end(JSON.stringify({ok:true,message:'Twitter post triggered'}));
+      }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
+    });return;
+  }
+
+  if(req.method==='GET'&&url==='/twitter/status'){
+    res.writeHead(200);res.end(JSON.stringify({
+      hasApiKey: !!TWITTER.API_KEY,
+      hasLunariToken: !!TWITTER.LUNARI_TOKEN,
+      hasLunariSecret: !!TWITTER.LUNARI_SECRET,
+      hasSerper: !!(process.env.SERPER_API_KEY)
+    }));return;
+  }
+
   if(req.method==='POST'&&url==='/schedules/run'){let b='';req.on('data',c=>b+=c);req.on('end',async()=>{try{const{id}=JSON.parse(b);const s=SCHEDULES.find(s=>s.id===id);if(!s){res.writeHead(404);return res.end(JSON.stringify({error:'Not found'}));}runSchedule(s);res.writeHead(200);res.end(JSON.stringify({ok:true}));}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
 
   if(req.method==='POST'&&url==='/schedules/add'){let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{const d=JSON.parse(b);const s={id:'s'+Date.now(),name:d.name||'New Schedule',agent:d.agent||'raven',prompt:d.prompt||'',schedule:d.schedule||'0 8 * * *',email:d.email||'',enabled:false,lastRun:null,nextRun:getNextRun(d.schedule||'0 8 * * *')};SCHEDULES.push(s);res.writeHead(200);res.end(JSON.stringify({ok:true,schedule:s}));}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
