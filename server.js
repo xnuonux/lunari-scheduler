@@ -525,15 +525,113 @@ function tick() {
   const now = new Date();
   SCHEDULES.forEach(s => { if(cronMatches(s.schedule, now)) runSchedule(s); });
 
-  // Morning briefs — fire at 8am daily
+  // Morning briefs — 8am daily
   if (now.getHours() === 8 && now.getMinutes() === 0) {
     sendMorningBriefs().catch(e => console.error('[BRIEFS]', e.message));
   }
 
-  // Daily outreach — fire at 9am, write + send for all active users
+  // Daily outreach — 9am
   if (now.getHours() === 9 && now.getMinutes() === 0) {
     runDailyOutreach().catch(e => console.error('[OUTREACH TICK]', e.message));
   }
+
+  // Autonomous @LunariPro posts — 10am daily
+  if (now.getHours() === 10 && now.getMinutes() === 0) {
+    runAutonomousTwitter().catch(e => console.error('[TWITTER AUTO]', e.message));
+  }
+
+  // Engagement replies — 2pm daily
+  if (now.getHours() === 14 && now.getMinutes() === 0) {
+    runTwitterEngagement().catch(e => console.error('[TWITTER ENGAGE]', e.message));
+  }
+}
+
+// ── SERPER LIVE WEB SEARCH ────────────────────────
+async function serperSearch(query) {
+  const key = process.env.SERPER_API_KEY || '';
+  if (!key) { console.log('[SERPER] No API key'); return null; }
+  return new Promise((resolve) => {
+    const body = JSON.stringify({ q: query, num: 5 });
+    const opts = {
+      hostname: 'google.serper.dev', path: '/search', method: 'POST',
+      headers: { 'X-API-KEY': key, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+    };
+    const req = https.request(opts, res => {
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve(null); } });
+    });
+    req.on('error', () => resolve(null));
+    req.write(body); req.end();
+  });
+}
+
+// ── AUTONOMOUS @LUNARI PRO TWITTER ───────────────
+function postLunariTweet(text) {
+  return new Promise((resolve) => {
+    if (!TWITTER.API_KEY || !TWITTER.LUNARI_TOKEN) return resolve(false);
+    const body = JSON.stringify({ text: text.slice(0, 280) });
+    const tweetUrl = 'https://api.twitter.com/2/tweets';
+    const authHeader = oauthSign('POST', tweetUrl, {}, TWITTER.API_KEY, TWITTER.API_SECRET, TWITTER.LUNARI_TOKEN, TWITTER.LUNARI_SECRET);
+    const opts = {
+      hostname: 'api.twitter.com', path: '/2/tweets', method: 'POST',
+      headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+    };
+    const req = https.request(opts, res => {
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => {
+        console.log('[TWITTER AUTO] status:', res.statusCode, d.slice(0,80));
+        resolve(res.statusCode === 201 || res.statusCode === 200);
+      });
+    });
+    req.on('error', e => { console.error('[TWITTER AUTO]', e.message); resolve(false); });
+    req.write(body); req.end();
+  });
+}
+
+async function runAutonomousTwitter() {
+  if (!TWITTER.LUNARI_TOKEN || !CONFIG.ANTHROPIC_KEY) return;
+  console.log('[TWITTER AUTO] Running daily post...');
+  try {
+    const topics = ['AI tools for creators 2026', 'autonomous AI agents', 'solo founder productivity AI', 'AI marketing automation'];
+    const query = topics[new Date().getDay() % topics.length];
+    const results = await serperSearch(query);
+    let context = 'AI tools are transforming how solo creators and founders work';
+    if (results && results.organic) {
+      context = results.organic.slice(0, 3).map(r => r.title + ': ' + (r.snippet||'').slice(0,100)).join('\n');
+    }
+    const prompt = `You are GEN, marketing agent for LUNARI (lunari.pro) — autonomous AI crew for solo creators.
+
+Trending today:\n${context}
+
+Write ONE sharp tweet for @LunariPro. Rules:
+- Under 240 characters
+- No hashtags, no corporate speak
+- Provocative insight OR contrarian take OR specific useful truth
+- Human voice. Confident. Not an ad.
+- Only mention LUNARI if completely natural
+
+Return ONLY the tweet text.`;
+    const tweet = await callClaude('gen', prompt, CONFIG.ANTHROPIC_KEY);
+    const clean = tweet.replace(/^["']|["']$/g, '').trim();
+    const ok = await postLunariTweet(clean);
+    if (ok) console.log('[TWITTER AUTO] Posted:', clean.slice(0,80));
+  } catch(e) { console.error('[TWITTER AUTO]', e.message); }
+}
+
+async function runTwitterEngagement() {
+  if (!TWITTER.LUNARI_TOKEN || !CONFIG.ANTHROPIC_KEY) return;
+  console.log('[TWITTER ENGAGE] Running...');
+  try {
+    const terms = ['AI agent tools', 'autonomous AI', 'solo founder AI'];
+    const query = terms[new Date().getDay() % terms.length];
+    const results = await serperSearch(query + ' site:x.com');
+    if (!results || !results.organic) return;
+    const context = results.organic.slice(0, 3).map(r => r.title).join('\n');
+    const prompt = `You are X, execution agent for LUNARI. Write ONE sharp 180-char tweet that adds value to this AI conversation:\n${context}\nNo hashtags. No emojis. Smart observation, not an ad.\nReturn ONLY the tweet.`;
+    const tweet = await callClaude('x', prompt, CONFIG.ANTHROPIC_KEY);
+    await postLunariTweet(tweet.replace(/^["']|["']$/g, '').trim());
+    console.log('[TWITTER ENGAGE] Done');
+  } catch(e) { console.error('[TWITTER ENGAGE]', e.message); }
 }
 
 // Daily outreach — write + send 10 emails per opted-in user
@@ -1090,6 +1188,28 @@ async function saveToGoogleDocs(userId, title, content, category) {
 }
 
   // ── CONTACT RESEARCH + OUTREACH ──────────────────
+
+  // Manual save — save a list of contacts directly
+  if(req.method==='POST'&&url==='/outreach/save'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try{
+        const{userId,contacts,industry}=JSON.parse(b);
+        if(!userId||!contacts||!contacts.length){res.writeHead(400);return res.end(JSON.stringify({error:'Missing fields'}));}
+        let saved=0;
+        for(const c of contacts){
+          const r=await sbFetch('POST','outreach_contacts',{
+            user_id:userId,name:c.name||'',company:c.company||c.platform||'Independent',
+            title:c.role||c.title||'Producer',email:c.email||'',
+            source:c.platform||c.source||'',industry:industry||'Music Production',
+            notes:c.why||c.notes||c.angle||'',status:'pending'
+          }).catch(()=>null);
+          if(r)saved++;
+        }
+        console.log('[OUTREACH] Manually saved',saved,'contacts for',userId);
+        res.writeHead(200);res.end(JSON.stringify({ok:true,saved}));
+      }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
+    });return;
+  }
 
   // Research contacts — ATLAS finds real people via web search
   if(req.method==='POST'&&url==='/outreach/research'){
