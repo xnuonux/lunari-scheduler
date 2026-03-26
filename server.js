@@ -46,6 +46,33 @@ function sbFetch(method, path, body) {
   });
 }
 
+// Service role version — bypasses RLS for admin operations
+function sbAdmin(method, path, body) {
+  return new Promise((resolve, reject) => {
+    const key = CONFIG.SUPABASE_SERVICE_KEY || CONFIG.SUPABASE_KEY;
+    if (!CONFIG.SUPABASE_URL || !key) return resolve(null);
+    const u = new URL(CONFIG.SUPABASE_URL);
+    const bodyStr = body ? JSON.stringify(body) : null;
+    const opts = {
+      hostname: u.hostname, path: '/rest/v1/' + path, method,
+      headers: {
+        'apikey': key,
+        'Authorization': 'Bearer ' + key,
+        'Content-Type': 'application/json',
+        'Prefer': 'return=representation',
+      }
+    };
+    if (bodyStr) opts.headers['Content-Length'] = Buffer.byteLength(bodyStr);
+    const req = https.request(opts, res => {
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve(null); } });
+    });
+    req.on('error', () => resolve(null));
+    if (bodyStr) req.write(bodyStr);
+    req.end();
+  });
+}
+
 async function getUserSiteData(userId) {
   if (!userId || userId === 'demo') return null;
   const rows = await sbFetch('GET', `user_credits?user_id=eq.${userId}&select=sites_built,site_limit,plan&limit=1`);
@@ -805,13 +832,13 @@ async function saveToGoogleDocs(userId, title, content, category) {
         if(!userId||!code){res.writeHead(400);return res.end(JSON.stringify({error:'Missing fields'}));}
 
         // Find the pending link
-        const rows=await sbFetch('GET',`telegram_links?link_code=eq.${code.toUpperCase()}&select=telegram_chat_id,telegram_username&limit=1`).catch(()=>null);
+        const rows=await sbAdmin('GET',`telegram_links?link_code=eq.${code.toUpperCase()}&select=telegram_chat_id,telegram_username&limit=1`).catch(()=>null);
         if(!rows||!rows[0]){res.writeHead(200);return res.end(JSON.stringify({ok:false,error:'Invalid or expired code'}));}
 
         const{telegram_chat_id,telegram_username}=rows[0];
 
         // Complete the link
-        await sbFetch('PATCH',`telegram_links?link_code=eq.${code.toUpperCase()}`,{
+        await sbAdmin('PATCH',`telegram_links?link_code=eq.${code.toUpperCase()}`,{
           user_id:userId,
           link_code:null,
           linked_at:new Date().toISOString()
@@ -842,7 +869,7 @@ async function saveToGoogleDocs(userId, title, content, category) {
     const params=new URLSearchParams(req.url.split('?')[1]||'');
     const userId=params.get('userId')||'';
     (async()=>{
-      const rows=await sbFetch('GET',`telegram_links?user_id=eq.${userId}&select=telegram_chat_id,telegram_username,linked_at&limit=1`).catch(()=>null);
+      const rows=await sbAdmin('GET',`telegram_links?user_id=eq.${userId}&select=telegram_chat_id,telegram_username,linked_at&limit=1`).catch(()=>null);
       const linked=rows&&rows[0]&&rows[0].telegram_chat_id;
       res.writeHead(200);res.end(JSON.stringify({
         linked:!!linked,
@@ -857,7 +884,7 @@ async function saveToGoogleDocs(userId, title, content, category) {
     let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
       try{
         const{userId}=JSON.parse(b);
-        await sbFetch('DELETE',`telegram_links?user_id=eq.${userId}`).catch(()=>{});
+        await sbAdmin('DELETE',`telegram_links?user_id=eq.${userId}`).catch(()=>{});
         res.writeHead(200);res.end(JSON.stringify({ok:true}));
       }catch(e){res.writeHead(400);res.end(JSON.stringify({error:e.message}));}
     });return;
@@ -1349,7 +1376,7 @@ function detectTgAgent(text) {
 
 // Get linked user for a Telegram chat ID
 async function getTgLinkedUser(chatId) {
-  const rows = await sbFetch('GET', `telegram_links?telegram_chat_id=eq.${chatId}&select=user_id,telegram_username&limit=1`).catch(() => null);
+  const rows = await sbAdmin('GET', `telegram_links?telegram_chat_id=eq.${chatId}&select=user_id,telegram_username&limit=1`).catch(() => null);
   return (rows && rows[0]) ? rows[0] : null;
 }
 
@@ -1448,14 +1475,14 @@ async function handleTgMessage(msg) {
     // Generate a link code and store it temporarily
     const code = genLinkCode();
     // Store with null user_id temporarily — web will complete the link
-    await sbFetch('POST', 'telegram_links', {
+    await sbAdmin('POST', 'telegram_links', {
       telegram_chat_id: chatId,
       telegram_username: tgUsername,
       link_code: code,
       user_id: '00000000-0000-0000-0000-000000000000' // placeholder
     }).catch(async () => {
       // Already exists — update the code
-      await sbFetch('PATCH', `telegram_links?telegram_chat_id=eq.${chatId}`, {
+      await sbAdmin('PATCH', `telegram_links?telegram_chat_id=eq.${chatId}`, {
         link_code: code,
         telegram_username: tgUsername
       });
@@ -1474,7 +1501,7 @@ async function handleTgMessage(msg) {
       await tgSend(chatId, `no account linked yet. use /link to connect.`);
       return;
     }
-    await sbFetch('DELETE', `telegram_links?telegram_chat_id=eq.${chatId}`).catch(() => {});
+    await sbAdmin('DELETE', `telegram_links?telegram_chat_id=eq.${chatId}`).catch(() => {});
     session.linked = false;
     session.userId = null;
     session.messages = [];
