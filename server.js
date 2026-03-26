@@ -796,6 +796,73 @@ async function saveToGoogleDocs(userId, title, content, category) {
   }
 }
 
+  // ── TELEGRAM LINK API ────────────────────────────
+  // Complete account link from web app
+  if(req.method==='POST'&&url==='/telegram/link'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try{
+        const{userId,code}=JSON.parse(b);
+        if(!userId||!code){res.writeHead(400);return res.end(JSON.stringify({error:'Missing fields'}));}
+
+        // Find the pending link
+        const rows=await sbFetch('GET',`telegram_links?link_code=eq.${code.toUpperCase()}&select=telegram_chat_id,telegram_username&limit=1`).catch(()=>null);
+        if(!rows||!rows[0]){res.writeHead(200);return res.end(JSON.stringify({ok:false,error:'Invalid or expired code'}));}
+
+        const{telegram_chat_id,telegram_username}=rows[0];
+
+        // Complete the link
+        await sbFetch('PATCH',`telegram_links?link_code=eq.${code.toUpperCase()}`,{
+          user_id:userId,
+          link_code:null,
+          linked_at:new Date().toISOString()
+        });
+
+        // Update in-memory session
+        if(TG_SESSIONS[telegram_chat_id]){
+          TG_SESSIONS[telegram_chat_id].linked=true;
+          TG_SESSIONS[telegram_chat_id].userId=userId;
+          // Load their history
+          const history=await tgLoadHistory(userId);
+          if(history.length>0) TG_SESSIONS[telegram_chat_id].messages=history;
+        }
+
+        // Notify user on Telegram
+        await tgSend(telegram_chat_id,
+          `✓ *linked!*\n\nyour lunari.pro account is now connected.\n\nyour Fuel, memory, and chat history sync across web and Telegram.\n\nwhat are we working on?`
+        );
+
+        console.log('[TG LINK] Linked user',userId,'to chat',telegram_chat_id);
+        res.writeHead(200);res.end(JSON.stringify({ok:true,telegram_username}));
+      }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
+    });return;
+  }
+
+  // Get Telegram link status for a user
+  if(req.method==='GET'&&url.startsWith('/telegram/status')){
+    const params=new URLSearchParams(req.url.split('?')[1]||'');
+    const userId=params.get('userId')||'';
+    (async()=>{
+      const rows=await sbFetch('GET',`telegram_links?user_id=eq.${userId}&select=telegram_chat_id,telegram_username,linked_at&limit=1`).catch(()=>null);
+      const linked=rows&&rows[0]&&rows[0].telegram_chat_id;
+      res.writeHead(200);res.end(JSON.stringify({
+        linked:!!linked,
+        username:(rows&&rows[0]&&rows[0].telegram_username)||'',
+        linked_at:(rows&&rows[0]&&rows[0].linked_at)||null
+      }));
+    })();return;
+  }
+
+  // Unlink Telegram from web
+  if(req.method==='POST'&&url==='/telegram/unlink'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try{
+        const{userId}=JSON.parse(b);
+        await sbFetch('DELETE',`telegram_links?user_id=eq.${userId}`).catch(()=>{});
+        res.writeHead(200);res.end(JSON.stringify({ok:true}));
+      }catch(e){res.writeHead(400);res.end(JSON.stringify({error:e.message}));}
+    });return;
+  }
+
   // ── GOOGLE DRIVE SAVE ────────────────────────────
   if(req.method==='POST'&&url==='/drive/save'){
     let b=''; req.on('data', c => b += c);
@@ -1280,28 +1347,78 @@ function detectTgAgent(text) {
   return 'raven';
 }
 
+// Get linked user for a Telegram chat ID
+async function getTgLinkedUser(chatId) {
+  const rows = await sbFetch('GET', `telegram_links?telegram_chat_id=eq.${chatId}&select=user_id,telegram_username&limit=1`).catch(() => null);
+  return (rows && rows[0]) ? rows[0] : null;
+}
+
+// Generate a 6-char link code
+function genLinkCode() {
+  return Math.random().toString(36).slice(2, 8).toUpperCase();
+}
+
+// Load user's chat history from Supabase
+async function tgLoadHistory(userId) {
+  const rows = await sbFetch('GET', `chat_history?user_id=eq.${userId}&select=messages&limit=1`).catch(() => null);
+  if (rows && rows[0] && rows[0].messages) return rows[0].messages.slice(-20);
+  return [];
+}
+
+// Save messages back to Supabase
+async function tgSaveHistory(userId, messages) {
+  await sbFetch('POST', 'chat_history', {
+    user_id: userId,
+    messages: messages.slice(-50),
+    updated_at: new Date().toISOString()
+  }).catch(() => {});
+}
+
+// Get user's Fuel balance
+async function tgGetCredits(userId) {
+  const rows = await sbFetch('GET', `user_credits?user_id=eq.${userId}&select=credits,plan&limit=1`).catch(() => null);
+  return (rows && rows[0]) ? rows[0] : { credits: 0, plan: 'free' };
+}
+
 async function handleTgMessage(msg) {
   const chatId = msg.chat.id;
   const text = msg.text || '';
-  const username = msg.from && msg.from.username ? msg.from.username : (msg.from && msg.from.first_name ? msg.from.first_name : 'there');
+  const tgUsername = msg.from && msg.from.username ? msg.from.username : (msg.from && msg.from.first_name ? msg.from.first_name : 'there');
 
   // Init session
   if (!TG_SESSIONS[chatId]) {
-    TG_SESSIONS[chatId] = { messages: [], agent: 'raven', userId: null };
+    TG_SESSIONS[chatId] = { messages: [], agent: 'raven', userId: null, linked: false };
   }
   const session = TG_SESSIONS[chatId];
 
-  // Commands
+  // Check if linked (lazy load once per session)
+  if (!session.linked) {
+    const linked = await getTgLinkedUser(chatId);
+    if (linked) {
+      session.userId = linked.user_id;
+      session.linked = true;
+      // Load their web chat history
+      if (session.messages.length === 0) {
+        session.messages = await tgLoadHistory(linked.user_id);
+      }
+    }
+  }
+
+  // ── COMMANDS ──────────────────────────────────────
+
   if (text === '/start') {
+    const linked = session.linked;
     await tgSend(chatId,
-      `🌙 *welcome to LUNARI, ${username}.*\n\n` +
+      `🌙 *welcome to LUNARI${linked ? '' : ', ' + tgUsername}.*\n\n` +
       `you just got a crew of five AI agents:\n` +
       `🪶 *RAVEN* — lead agent\n` +
       `✨ *NOVA* — writing & content\n` +
       `🗺️ *ATLAS* — research & intel\n` +
       `🌀 *GEN* — marketing strategy\n` +
       `✕ *X* — quick answers\n\n` +
-      `just talk to me. or use @nova, @atlas, @gen, @x to route directly.\n\n` +
+      (linked
+        ? `✓ *linked to your lunari.pro account.* your memory and Fuel carry over.\n\n`
+        : `type /link to connect your lunari.pro account and sync your memory + Fuel.\n\n`) +
       `chat is free. what are we working on?`
     );
     return;
@@ -1309,47 +1426,115 @@ async function handleTgMessage(msg) {
 
   if (text === '/help') {
     await tgSend(chatId,
-      `*LUNARI crew commands:*\n\n` +
-      `Just type naturally — RAVEN routes your request.\n\n` +
-      `@nova — writing, copy, emails\n` +
-      `@atlas — research, competitors, intel\n` +
-      `@gen — strategy, marketing, growth\n` +
-      `@x — quick one-liner answers\n\n` +
+      `*LUNARI commands:*\n\n` +
+      `just talk — RAVEN routes your request\n` +
+      `@nova, @atlas, @gen, @x — route directly\n\n` +
+      `/link — connect your lunari.pro account\n` +
+      `/unlink — disconnect account\n` +
+      `/status — your account status\n` +
+      `/memory — what the crew remembers\n` +
       `/clear — clear conversation memory\n` +
-      `/status — check your account\n` +
-      `/web — go to lunari.pro`
+      `/web — open lunari.pro\n` +
+      `/help — this list`
     );
+    return;
+  }
+
+  if (text === '/link') {
+    if (session.linked) {
+      await tgSend(chatId, `✓ already linked to your lunari.pro account.\n\nuse /unlink to disconnect.`);
+      return;
+    }
+    // Generate a link code and store it temporarily
+    const code = genLinkCode();
+    // Store with null user_id temporarily — web will complete the link
+    await sbFetch('POST', 'telegram_links', {
+      telegram_chat_id: chatId,
+      telegram_username: tgUsername,
+      link_code: code,
+      user_id: '00000000-0000-0000-0000-000000000000' // placeholder
+    }).catch(async () => {
+      // Already exists — update the code
+      await sbFetch('PATCH', `telegram_links?telegram_chat_id=eq.${chatId}`, {
+        link_code: code,
+        telegram_username: tgUsername
+      });
+    });
+    await tgSend(chatId,
+      `🔗 *link your lunari.pro account*\n\n` +
+      `your link code: \`${code}\`\n\n` +
+      `go to lunari.pro → Settings → Telegram → enter this code\n\n` +
+      `code expires in 10 minutes.`
+    );
+    return;
+  }
+
+  if (text === '/unlink') {
+    if (!session.linked) {
+      await tgSend(chatId, `no account linked yet. use /link to connect.`);
+      return;
+    }
+    await sbFetch('DELETE', `telegram_links?telegram_chat_id=eq.${chatId}`).catch(() => {});
+    session.linked = false;
+    session.userId = null;
+    session.messages = [];
+    await tgSend(chatId, `✓ account unlinked. your Telegram session is now independent.\n\nuse /link anytime to reconnect.`);
+    return;
+  }
+
+  if (text === '/status') {
+    if (!session.linked) {
+      await tgSend(chatId,
+        `*not linked.*\n\nuse /link to connect your lunari.pro account and sync Fuel, memory, and history.`
+      );
+      return;
+    }
+    const creds = await tgGetCredits(session.userId);
+    await tgSend(chatId,
+      `*your LUNARI account:*\n\n` +
+      `⚡ Fuel: ${creds.credits}\n` +
+      `📋 Plan: ${(creds.plan || 'free').toUpperCase()}\n` +
+      `🔗 Linked: yes\n\n` +
+      `chat is always free. Fuel only burns on builds.`
+    );
+    return;
+  }
+
+  if (text === '/memory') {
+    const memCount = session.messages.length;
+    if (memCount === 0) {
+      await tgSend(chatId, `🧠 no memory yet. start chatting and the crew will remember.`);
+    } else {
+      await tgSend(chatId, `🧠 *${memCount} messages* in active memory.\n\nthe crew has context from this session.${session.linked ? ' history syncs to your lunari.pro account.' : ''}`);
+    }
     return;
   }
 
   if (text === '/clear') {
     session.messages = [];
+    if (session.linked && session.userId) {
+      await tgSaveHistory(session.userId, []);
+    }
     await tgSend(chatId, '🌙 memory cleared. fresh start.');
     return;
   }
 
   if (text === '/web') {
-    await tgSend(chatId, '🌐 lunari.pro — your full crew is there too.');
+    await tgSend(chatId, '🌐 [lunari.pro](https://lunari.pro) — your full crew is there too.');
     return;
   }
 
-  if (text === '/status') {
-    await tgSend(chatId, `✕ you're connected to LUNARI via Telegram.\n\ncreate an account at lunari.pro to track your Fuel, builds, and history across devices.`);
-    return;
-  }
+  // ── AGENT RESPONSE ────────────────────────────────
 
-  // Show typing indicator
   await tgRequest('sendChatAction', { chat_id: chatId, action: 'typing' });
 
-  // Detect agent and build message history
   const agentId = detectTgAgent(text);
   const system = AGENT_SYSTEMS_TG[agentId];
 
   session.messages.push({ role: 'user', content: text });
-  const trimmed = session.messages.slice(-12); // keep last 12 for context
+  const trimmed = session.messages.slice(-12);
 
   try {
-    // Call Claude
     const bodyStr = JSON.stringify({
       model: agentId === 'raven' ? 'claude-opus-4-6' : 'claude-sonnet-4-6',
       max_tokens: 1000,
@@ -1382,10 +1567,13 @@ async function handleTgMessage(msg) {
     });
 
     session.messages.push({ role: 'assistant', content: reply });
-    // Cap session memory at 20 messages
     if (session.messages.length > 20) session.messages = session.messages.slice(-20);
 
-    // Send reply with agent prefix
+    // Save history to Supabase if linked
+    if (session.linked && session.userId) {
+      tgSaveHistory(session.userId, session.messages).catch(() => {});
+    }
+
     const prefix = agentId === 'raven' ? '🪶' : agentId === 'nova' ? '✨' : agentId === 'atlas' ? '🗺️' : agentId === 'gen' ? '🌀' : '✕';
     await tgSend(chatId, `${prefix} *${agentId.toUpperCase()}*\n\n${reply}`);
 
@@ -1420,18 +1608,22 @@ async function tgBroadcast(message, userIds) {
   console.log('[TG BROADCAST] Would send to', userIds ? userIds.length : 'all', 'users');
 }
 
+// Telegram link completion endpoint — called from web app
+// Handled in handleRequest above
+
 // Start polling if token is set
 if (CONFIG.TELEGRAM_TOKEN) {
   setInterval(tgPoll, 3000);
   console.log('[LUNARI] Telegram: ACTIVE');
 
-  // Set bot commands on startup
   setTimeout(() => {
     tgRequest('setMyCommands', { commands: [
       { command: 'start', description: 'Meet your LUNARI crew' },
-      { command: 'help', description: 'How to use LUNARI' },
+      { command: 'link', description: 'Connect your lunari.pro account' },
+      { command: 'status', description: 'Your Fuel and account status' },
+      { command: 'memory', description: 'What the crew remembers' },
       { command: 'clear', description: 'Clear conversation memory' },
-      { command: 'status', description: 'Your account status' },
+      { command: 'help', description: 'All commands' },
       { command: 'web', description: 'Open lunari.pro' },
     ]}).then(() => console.log('[TG] Commands set'));
   }, 2000);
