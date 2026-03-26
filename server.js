@@ -795,6 +795,54 @@ async function saveToGoogleDocs(userId, title, content, category) {
     }); return;
   }
 
+  // ── JOB QUEUE API ─────────────────────────────────
+
+  // Create a new job
+  if(req.method==='POST'&&url==='/jobs/create'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try {
+        const{userId,type,agent,prompt}=JSON.parse(b);
+        if(!userId||!type||!prompt){res.writeHead(400);return res.end(JSON.stringify({error:'Missing fields'}));}
+        const job = await sbFetch('POST','jobs',{
+          user_id:userId,type,agent:agent||'raven',prompt,status:'pending'
+        });
+        console.log('[JOB] Created:',type,'for',userId);
+        res.writeHead(200);res.end(JSON.stringify({ok:true,jobId:job&&job[0]?job[0].id:'unknown'}));
+      }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
+    });return;
+  }
+
+  // Get job status
+  if(req.method==='GET'&&url.startsWith('/jobs/status/')){
+    const jobId=url.split('/jobs/status/')[1];
+    (async()=>{
+      const rows=await sbFetch('GET',`jobs?id=eq.${jobId}&select=id,status,type,agent,result,error,created_at,started_at,completed_at&limit=1`).catch(()=>null);
+      if(!rows||!rows[0]){res.writeHead(404);return res.end(JSON.stringify({error:'Not found'}));}
+      res.writeHead(200);res.end(JSON.stringify(rows[0]));
+    })();return;
+  }
+
+  // List jobs for a user
+  if(req.method==='GET'&&url.startsWith('/jobs/list')){
+    const params=new URLSearchParams(req.url.split('?')[1]||'');
+    const userId=params.get('userId')||'';
+    (async()=>{
+      const rows=await sbFetch('GET',`jobs?user_id=eq.${userId}&order=created_at.desc&limit=20&select=id,status,type,agent,prompt,created_at,completed_at,error`).catch(()=>[]);
+      res.writeHead(200);res.end(JSON.stringify({jobs:rows||[]}));
+    })();return;
+  }
+
+  // Cancel a job
+  if(req.method==='POST'&&url==='/jobs/cancel'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try{
+        const{jobId,userId}=JSON.parse(b);
+        await sbFetch('PATCH',`jobs?id=eq.${jobId}&user_id=eq.${userId}&status=eq.pending`,{status:'cancelled'});
+        res.writeHead(200);res.end(JSON.stringify({ok:true}));
+      }catch(e){res.writeHead(400);res.end(JSON.stringify({error:e.message}));}
+    });return;
+  }
+
   // ── ADMIN ─────────────────────────────────────────
   if(req.method==='GET'&&url.startsWith('/admin/users')){
     const params = new URLSearchParams(req.url.split('?')[1]||'');
@@ -1047,10 +1095,113 @@ async function saveToGoogleDocs(userId, title, content, category) {
 }
 
 const server=http.createServer(handleRequest);
+// ── JOB QUEUE ─────────────────────────────────────
+const RUNNING_JOBS = {}; // in-memory set of currently running job IDs
+
+async function processJobs() {
+  if (!CONFIG.SUPABASE_URL || !CONFIG.ANTHROPIC_KEY) return;
+  try {
+    // Pick up to 3 pending jobs at a time
+    const pending = await sbFetch('GET', 'jobs?status=eq.pending&order=created_at.asc&limit=3');
+    if (!pending || !pending.length) return;
+
+    for (const job of pending) {
+      if (RUNNING_JOBS[job.id]) continue; // already running
+      RUNNING_JOBS[job.id] = true;
+
+      // Mark as running
+      await sbFetch('PATCH', `jobs?id=eq.${job.id}`, {
+        status: 'running',
+        started_at: new Date().toISOString()
+      });
+
+      console.log('[JOB] Starting:', job.id, job.type, job.agent);
+
+      // Run async — don't await so multiple jobs can run in parallel
+      runJob(job).then(async (result) => {
+        await sbFetch('PATCH', `jobs?id=eq.${job.id}`, {
+          status: 'done',
+          result: result.slice(0, 50000), // cap at 50k chars
+          completed_at: new Date().toISOString()
+        });
+        console.log('[JOB] Done:', job.id);
+        delete RUNNING_JOBS[job.id];
+      }).catch(async (err) => {
+        await sbFetch('PATCH', `jobs?id=eq.${job.id}`, {
+          status: 'failed',
+          error: err.message,
+          completed_at: new Date().toISOString()
+        });
+        console.error('[JOB] Failed:', job.id, err.message);
+        delete RUNNING_JOBS[job.id];
+      });
+    }
+  } catch(e) {
+    console.error('[JOB QUEUE] Error:', e.message);
+  }
+}
+
+async function runJob(job) {
+  const type = job.type;
+  const agent = job.agent || 'raven';
+  const prompt = job.prompt || '';
+
+  // Multi-step research job — the kind that takes 5-40 minutes
+  if (type === 'research') {
+    const steps = [
+      `Do a thorough research overview on this topic: "${prompt}". Cover the landscape, key players, recent developments, and what matters most. Be comprehensive.`,
+      `Based on your research on "${prompt}", identify the top opportunities, risks, and strategic insights. Go deep.`,
+      `Synthesize everything into a final structured report on "${prompt}" with: Executive Summary, Key Findings, Opportunities, Risks, Recommended Actions. Format clearly.`
+    ];
+    let fullResult = '';
+    for (let i = 0; i < steps.length; i++) {
+      console.log(`[JOB] ${job.id} step ${i+1}/${steps.length}`);
+      const stepResult = await callClaude(agent, steps[i] + (fullResult ? `\n\nContext from previous steps:\n${fullResult.slice(-2000)}` : ''), CONFIG.ANTHROPIC_KEY);
+      fullResult += `\n\n--- Step ${i+1} ---\n${stepResult}`;
+    }
+    return fullResult;
+  }
+
+  if (type === 'strategy') {
+    const steps = [
+      `Analyze this business/marketing challenge in depth: "${prompt}". Cover the current situation, key variables, and what success looks like.`,
+      `Generate 5 distinct strategic approaches for: "${prompt}". For each: the core idea, execution steps, timeline, risks, and expected outcome.`,
+      `Build a complete 90-day action plan for: "${prompt}". Week by week for the first month, then month by month. Be specific and actionable.`
+    ];
+    let fullResult = '';
+    for (let i = 0; i < steps.length; i++) {
+      console.log(`[JOB] ${job.id} step ${i+1}/${steps.length}`);
+      const stepResult = await callClaude(agent, steps[i] + (fullResult ? `\n\nPrevious analysis:\n${fullResult.slice(-2000)}` : ''), CONFIG.ANTHROPIC_KEY);
+      fullResult += `\n\n--- Phase ${i+1} ---\n${stepResult}`;
+    }
+    return fullResult;
+  }
+
+  if (type === 'content_plan') {
+    const steps = [
+      `Research the content landscape for: "${prompt}". What's working, what's overdone, what gaps exist, who the audience is.`,
+      `Generate 30 content ideas for: "${prompt}". Vary the format (articles, videos, threads, newsletters). Include angles, hooks, and why each works.`,
+      `Build a complete 30-day content calendar for: "${prompt}". Day by day, with title, format, key message, and call to action for each piece.`
+    ];
+    let fullResult = '';
+    for (let i = 0; i < steps.length; i++) {
+      console.log(`[JOB] ${job.id} step ${i+1}/${steps.length}`);
+      const stepResult = await callClaude(agent, steps[i] + (fullResult ? `\n\nPrevious work:\n${fullResult.slice(-2000)}` : ''), CONFIG.ANTHROPIC_KEY);
+      fullResult += `\n\n--- Part ${i+1} ---\n${stepResult}`;
+    }
+    return fullResult;
+  }
+
+  // Default: single deep call with extended thinking time
+  return await callClaude(agent, `Do a thorough, comprehensive job on this task. Take your time and go deep:\n\n${prompt}`, CONFIG.ANTHROPIC_KEY);
+}
+
 server.listen(CONFIG.PORT,()=>{
-  console.log('[LUNARI] v3 on port '+CONFIG.PORT);
+  console.log('[LUNARI] v4 on port '+CONFIG.PORT);
   console.log('[LUNARI] Anthropic: '+(CONFIG.ANTHROPIC_KEY?'SET':'NOT SET'));
   console.log('[LUNARI] Netlify: '+(CONFIG.NETLIFY_TOKEN?'SET':'NOT SET'));
   console.log('[LUNARI] Supabase: '+(CONFIG.SUPABASE_URL?'SET':'NOT SET'));
 });
-setInterval(tick,60*1000);
+
+setInterval(tick, 60*1000);
+setInterval(processJobs, 30*1000); // check for new jobs every 30s
