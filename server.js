@@ -744,37 +744,50 @@ async function saveToGoogleDocs(userId, title, content, category) {
   if (!token) return { ok: false, error: 'not_connected' };
 
   try {
-    // Get or create LUNARI folder structure
     const lunariId = await createLunariFolder(token);
     const folderMap = { research: 'Research', content: 'Content', strategy: 'Strategy', sites: 'Sites', general: 'General' };
     const folderName = folderMap[category] || 'General';
     const subFolderId = await createSubFolder(token, lunariId, folderName);
 
-    // Create Google Doc
     const docDate = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
     const docTitle = title + ' — ' + docDate;
 
+    // Create the Google Doc
     const createRes = await gmailRequest('/drive/v3/files', 'POST', {
       name: docTitle,
       mimeType: 'application/vnd.google-apps.document',
       parents: [subFolderId]
     }, token);
 
-    if (!createRes.data || !createRes.data.id) return { ok: false, error: 'Could not create doc' };
+    if (!createRes.data || !createRes.data.id) {
+      console.error('[DRIVE] Create failed:', JSON.stringify(createRes.data));
+      return { ok: false, error: 'Could not create doc' };
+    }
     const docId = createRes.data.id;
+    console.log('[DRIVE] Doc created:', docId);
 
-    // Write content to doc
-    const requests = [{
-      insertText: {
-        location: { index: 1 },
-        text: content.replace(/\*\*/g, '').replace(/\*/g, '').replace(/#+\s/g, '')
-      }
-    }];
+    // Clean content — strip markdown symbols
+    const cleanContent = content
+      .replace(/\*\*/g, '').replace(/\*/g, '')
+      .replace(/#{1,6}\s/g, '').replace(/`/g, '')
+      .trim();
 
-    await gmailRequest(`/docs/v1/documents/${docId}:batchUpdate`, 'POST', { requests }, token);
+    // Write content via Docs batchUpdate
+    const batchRes = await gmailRequest(`/docs/v1/documents/${docId}:batchUpdate`, 'POST', {
+      requests: [{ insertText: { location: { index: 1 }, text: cleanContent } }]
+    }, token);
+
+    console.log('[DRIVE] batchUpdate status:', batchRes.status);
+
+    if (batchRes.status !== 200) {
+      console.error('[DRIVE] batchUpdate failed:', JSON.stringify(batchRes.data).slice(0, 200));
+      // Doc exists but content write failed — still return the URL
+      const docUrl = 'https://docs.google.com/document/d/' + docId + '/edit';
+      return { ok: true, url: docUrl, title: docTitle, warning: 'Doc created but content write failed — you may need to reconnect Gmail in Settings to grant Docs permission.' };
+    }
 
     const docUrl = 'https://docs.google.com/document/d/' + docId + '/edit';
-    console.log('[DRIVE] Saved:', docTitle, docUrl);
+    console.log('[DRIVE] Saved:', docTitle);
     return { ok: true, url: docUrl, title: docTitle };
   } catch(e) {
     console.error('[DRIVE] Error:', e.message);
