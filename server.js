@@ -975,20 +975,22 @@ function handleRequest(req,res){
     });return;
   }
 
-  // Twitter diagnostic — posts a real test tweet and returns full API response
+  // Twitter diagnostic — tests credentials layer by layer
   if(req.method==='POST'&&url==='/twitter/test'){
     let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
       try{
-        const text = 'LUNARI systems check — ' + new Date().toISOString().slice(0,16) + ' 🌙';
-        const body = JSON.stringify({ text });
-        const tweetUrl = 'https://api.twitter.com/2/tweets';
-        const authHeader = oauthSign('POST', tweetUrl, {}, TWITTER.API_KEY, TWITTER.API_SECRET, TWITTER.LUNARI_TOKEN, TWITTER.LUNARI_SECRET);
-        const result = await new Promise((resolve) => {
+        const results = {};
+
+        // TEST 1: Verify consumer key/secret via OAuth 2.0 bearer token
+        // If this fails → API_KEY or API_SECRET is wrong
+        results.step1_consumer_keys = await new Promise((resolve) => {
+          const credentials = Buffer.from(TWITTER.API_KEY + ':' + TWITTER.API_SECRET).toString('base64');
+          const body = 'grant_type=client_credentials';
           const opts = {
-            hostname: 'api.twitter.com', path: '/2/tweets', method: 'POST',
+            hostname: 'api.twitter.com', path: '/oauth2/token', method: 'POST',
             headers: {
-              'Authorization': authHeader,
-              'Content-Type': 'application/json',
+              'Authorization': 'Basic ' + credentials,
+              'Content-Type': 'application/x-www-form-urlencoded',
               'Content-Length': Buffer.byteLength(body),
               'User-Agent': 'LUNARI/1.0'
             }
@@ -997,24 +999,89 @@ function handleRequest(req,res){
             let d = ''; r.on('data', c => d += c);
             r.on('end', () => {
               let parsed; try { parsed = JSON.parse(d); } catch(e) { parsed = d; }
-              resolve({ status: r.statusCode, headers: r.headers, body: parsed });
+              resolve({
+                status: r.statusCode,
+                ok: r.statusCode === 200,
+                verdict: r.statusCode === 200 ? 'CONSUMER KEYS VALID' : 'CONSUMER KEYS INVALID — check TWITTER_API_KEY and TWITTER_API_SECRET',
+                body: parsed
+              });
             });
           });
           req2.on('error', e => resolve({ status: 0, error: e.message }));
           req2.write(body); req2.end();
         });
-        console.log('[TWITTER TEST]', JSON.stringify(result));
-        res.writeHead(200);res.end(JSON.stringify({
-          test: 'twitter_post',
-          tweet_text: text,
-          credentials: {
-            API_KEY: TWITTER.API_KEY ? TWITTER.API_KEY.slice(0,6) + '...' : 'MISSING',
-            API_SECRET: TWITTER.API_SECRET ? 'SET (' + TWITTER.API_SECRET.length + ' chars)' : 'MISSING',
-            LUNARI_TOKEN: TWITTER.LUNARI_TOKEN ? TWITTER.LUNARI_TOKEN.slice(0,6) + '...' : 'MISSING',
-            LUNARI_SECRET: TWITTER.LUNARI_SECRET ? 'SET (' + TWITTER.LUNARI_SECRET.length + ' chars)' : 'MISSING',
-          },
-          result
-        }));
+
+        // TEST 2: Try posting a tweet with OAuth 1.0a
+        const text = 'LUNARI systems check — ' + new Date().toISOString().slice(0,16) + ' 🌙';
+        const tweetBody = JSON.stringify({ text });
+        const tweetUrl = 'https://api.twitter.com/2/tweets';
+        const authHeader = oauthSign('POST', tweetUrl, {}, TWITTER.API_KEY, TWITTER.API_SECRET, TWITTER.LUNARI_TOKEN, TWITTER.LUNARI_SECRET);
+
+        results.step2_tweet_post = await new Promise((resolve) => {
+          const opts = {
+            hostname: 'api.twitter.com', path: '/2/tweets', method: 'POST',
+            headers: {
+              'Authorization': authHeader,
+              'Content-Type': 'application/json',
+              'Content-Length': Buffer.byteLength(tweetBody),
+              'User-Agent': 'LUNARI/1.0'
+            }
+          };
+          const req2 = https.request(opts, r => {
+            let d = ''; r.on('data', c => d += c);
+            r.on('end', () => {
+              let parsed; try { parsed = JSON.parse(d); } catch(e) { parsed = d; }
+              let verdict = 'UNKNOWN';
+              if (r.statusCode === 201) verdict = 'TWEET POSTED SUCCESSFULLY';
+              else if (r.statusCode === 401) verdict = 'AUTH FAILED — access token may be wrong or OAuth 1.0a not enabled on app';
+              else if (r.statusCode === 403) verdict = 'FORBIDDEN — app lacks write permission or is suspended';
+              else if (r.statusCode === 429) verdict = 'RATE LIMITED — too many tweets';
+              resolve({ status: r.statusCode, verdict, body: parsed });
+            });
+          });
+          req2.on('error', e => resolve({ status: 0, error: e.message }));
+          req2.write(tweetBody); req2.end();
+        });
+
+        // TEST 3: Verify access token via /2/users/me using OAuth 1.0a
+        const meUrl = 'https://api.twitter.com/2/users/me';
+        const meAuth = oauthSign('GET', meUrl, {}, TWITTER.API_KEY, TWITTER.API_SECRET, TWITTER.LUNARI_TOKEN, TWITTER.LUNARI_SECRET);
+
+        results.step3_verify_token = await new Promise((resolve) => {
+          const opts = {
+            hostname: 'api.twitter.com', path: '/2/users/me', method: 'GET',
+            headers: {
+              'Authorization': meAuth,
+              'User-Agent': 'LUNARI/1.0'
+            }
+          };
+          const req2 = https.request(opts, r => {
+            let d = ''; r.on('data', c => d += c);
+            r.on('end', () => {
+              let parsed; try { parsed = JSON.parse(d); } catch(e) { parsed = d; }
+              let verdict = 'UNKNOWN';
+              if (r.statusCode === 200) verdict = 'ACCESS TOKEN VALID — OAuth 1.0a signing works, user: ' + (parsed.data ? parsed.data.username : '?');
+              else if (r.statusCode === 401) verdict = 'ACCESS TOKEN INVALID — LUNARI_TWITTER_TOKEN or LUNARI_TWITTER_SECRET is wrong';
+              else if (r.statusCode === 403) verdict = 'TOKEN VALID but endpoint forbidden — check API tier';
+              resolve({ status: r.statusCode, verdict, body: parsed });
+            });
+          });
+          req2.on('error', e => resolve({ status: 0, error: e.message }));
+          req2.end();
+        });
+
+        // Summary
+        const credentials = {
+          API_KEY: TWITTER.API_KEY ? TWITTER.API_KEY.slice(0,8) + '... (' + TWITTER.API_KEY.length + ' chars)' : 'MISSING',
+          API_SECRET: TWITTER.API_SECRET ? TWITTER.API_SECRET.slice(0,4) + '... (' + TWITTER.API_SECRET.length + ' chars)' : 'MISSING',
+          LUNARI_TOKEN: TWITTER.LUNARI_TOKEN ? TWITTER.LUNARI_TOKEN.slice(0,8) + '... (' + TWITTER.LUNARI_TOKEN.length + ' chars)' : 'MISSING',
+          LUNARI_SECRET: TWITTER.LUNARI_SECRET ? TWITTER.LUNARI_SECRET.slice(0,4) + '... (' + TWITTER.LUNARI_SECRET.length + ' chars)' : 'MISSING',
+          CLIENT_ID: TWITTER.CLIENT_ID ? TWITTER.CLIENT_ID.slice(0,6) + '... (' + TWITTER.CLIENT_ID.length + ' chars)' : 'NOT SET',
+        };
+        const authHeaderPreview = authHeader.slice(0, 80) + '...';
+
+        console.log('[TWITTER TEST]', JSON.stringify(results, null, 2));
+        res.writeHead(200);res.end(JSON.stringify({ credentials, authHeaderPreview, results }, null, 2));
       }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message,stack:e.stack}));}
     });return;
   }
