@@ -3,6 +3,14 @@ const https  = require('https');
 const http   = require('http');
 const crypto = require('crypto');
 
+// Prevent unhandled rejections from crashing the server
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[ERROR] Unhandled Rejection:', reason?.message || reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[ERROR] Uncaught Exception:', err.message);
+});
+
 const CONFIG = {
   ANTHROPIC_KEY:         process.env.ANTHROPIC_API_KEY       || '',
   NETLIFY_TOKEN:         process.env.NETLIFY_API_TOKEN        || '',
@@ -568,22 +576,32 @@ async function serperSearch(query) {
 // ── AUTONOMOUS @LUNARI PRO TWITTER ───────────────
 function postLunariTweet(text) {
   return new Promise((resolve) => {
-    if (!TWITTER.API_KEY || !TWITTER.LUNARI_TOKEN) return resolve(false);
+    if (!TWITTER.API_KEY || !TWITTER.LUNARI_TOKEN) {
+      console.log('[TWITTER AUTO] Missing credentials — API_KEY:', !!TWITTER.API_KEY, 'TOKEN:', !!TWITTER.LUNARI_TOKEN);
+      return resolve(false);
+    }
     const body = JSON.stringify({ text: text.slice(0, 280) });
     const tweetUrl = 'https://api.twitter.com/2/tweets';
     const authHeader = oauthSign('POST', tweetUrl, {}, TWITTER.API_KEY, TWITTER.API_SECRET, TWITTER.LUNARI_TOKEN, TWITTER.LUNARI_SECRET);
     const opts = {
       hostname: 'api.twitter.com', path: '/2/tweets', method: 'POST',
-      headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+      headers: {
+        'Authorization': authHeader,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'User-Agent': 'LUNARI/1.0'
+      }
     };
+    console.log('[TWITTER AUTO] Posting tweet (' + text.length + ' chars):', text.slice(0,60) + '...');
     const req = https.request(opts, res => {
       let d = ''; res.on('data', c => d += c);
       res.on('end', () => {
-        console.log('[TWITTER AUTO] status:', res.statusCode, d.slice(0,80));
+        console.log('[TWITTER AUTO] Response status:', res.statusCode);
+        console.log('[TWITTER AUTO] Response body:', d.slice(0, 500));
         resolve(res.statusCode === 201 || res.statusCode === 200);
       });
     });
-    req.on('error', e => { console.error('[TWITTER AUTO]', e.message); resolve(false); });
+    req.on('error', e => { console.error('[TWITTER AUTO] Request error:', e.message); resolve(false); });
     req.write(body); req.end();
   });
 }
@@ -620,9 +638,11 @@ Write ONE sharp tweet for @LunariPro. Rules:
 Return ONLY the tweet text.`;
     const tweet = await callClaude('gen', prompt, CONFIG.ANTHROPIC_KEY);
     const clean = tweet.replace(/^["']|["']$/g, '').trim();
+    console.log('[TWITTER AUTO] Generated tweet:', clean);
     const ok = await postLunariTweet(clean);
-    if (ok) console.log('[TWITTER AUTO] Posted:', clean.slice(0,80));
-  } catch(e) { console.error('[TWITTER AUTO]', e.message); }
+    if (ok) console.log('[TWITTER AUTO] ✓ Posted successfully');
+    else console.log('[TWITTER AUTO] ✗ Post FAILED — check response above');
+  } catch(e) { console.error('[TWITTER AUTO] Pipeline error:', e.message); }
 }
 
 async function runTwitterEngagement() {
@@ -776,21 +796,73 @@ function handleRequest(req,res){
       try{
         const{type='daily'}=JSON.parse(b||'{}');
         if(type==='engage') {
-          runTwitterEngagement().catch(()=>{});
+          runTwitterEngagement().catch(e=>console.error('[TWITTER ENGAGE] Trigger error:', e.message));
         } else {
-          runAutonomousTwitter().catch(()=>{});
+          runAutonomousTwitter().catch(e=>console.error('[TWITTER AUTO] Trigger error:', e.message));
         }
         res.writeHead(200);res.end(JSON.stringify({ok:true,message:'Twitter post triggered'}));
       }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
     });return;
   }
 
+  // Twitter diagnostic — posts a real test tweet and returns full API response
+  if(req.method==='POST'&&url==='/twitter/test'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try{
+        const text = 'LUNARI systems check — ' + new Date().toISOString().slice(0,16) + ' 🌙';
+        const body = JSON.stringify({ text });
+        const tweetUrl = 'https://api.twitter.com/2/tweets';
+        const authHeader = oauthSign('POST', tweetUrl, {}, TWITTER.API_KEY, TWITTER.API_SECRET, TWITTER.LUNARI_TOKEN, TWITTER.LUNARI_SECRET);
+        const result = await new Promise((resolve) => {
+          const opts = {
+            hostname: 'api.twitter.com', path: '/2/tweets', method: 'POST',
+            headers: {
+              'Authorization': authHeader,
+              'Content-Type': 'application/json',
+              'Content-Length': Buffer.byteLength(body),
+              'User-Agent': 'LUNARI/1.0'
+            }
+          };
+          const req2 = https.request(opts, r => {
+            let d = ''; r.on('data', c => d += c);
+            r.on('end', () => {
+              let parsed; try { parsed = JSON.parse(d); } catch(e) { parsed = d; }
+              resolve({ status: r.statusCode, headers: r.headers, body: parsed });
+            });
+          });
+          req2.on('error', e => resolve({ status: 0, error: e.message }));
+          req2.write(body); req2.end();
+        });
+        console.log('[TWITTER TEST]', JSON.stringify(result));
+        res.writeHead(200);res.end(JSON.stringify({
+          test: 'twitter_post',
+          tweet_text: text,
+          credentials: {
+            API_KEY: TWITTER.API_KEY ? TWITTER.API_KEY.slice(0,6) + '...' : 'MISSING',
+            API_SECRET: TWITTER.API_SECRET ? 'SET (' + TWITTER.API_SECRET.length + ' chars)' : 'MISSING',
+            LUNARI_TOKEN: TWITTER.LUNARI_TOKEN ? TWITTER.LUNARI_TOKEN.slice(0,6) + '...' : 'MISSING',
+            LUNARI_SECRET: TWITTER.LUNARI_SECRET ? 'SET (' + TWITTER.LUNARI_SECRET.length + ' chars)' : 'MISSING',
+          },
+          result
+        }));
+      }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message,stack:e.stack}));}
+    });return;
+  }
+
   if(req.method==='GET'&&url==='/twitter/status'){
     res.writeHead(200);res.end(JSON.stringify({
       hasApiKey: !!TWITTER.API_KEY,
+      hasApiSecret: !!TWITTER.API_SECRET,
       hasLunariToken: !!TWITTER.LUNARI_TOKEN,
       hasLunariSecret: !!TWITTER.LUNARI_SECRET,
-      hasSerper: !!(process.env.SERPER_API_KEY)
+      hasSerper: !!(process.env.SERPER_API_KEY),
+      hasAnthropic: !!CONFIG.ANTHROPIC_KEY,
+      keyLengths: {
+        API_KEY: TWITTER.API_KEY.length,
+        API_SECRET: TWITTER.API_SECRET.length,
+        LUNARI_TOKEN: TWITTER.LUNARI_TOKEN.length,
+        LUNARI_SECRET: TWITTER.LUNARI_SECRET.length
+      }
     }));return;
   }
 
@@ -822,6 +894,11 @@ const TWITTER_TOKENS = {};
 const TWITTER_STATES = {};
 
 // ── LUNARI auto-tweet on every build ─────────────
+// RFC 3986 percent-encoding (required by OAuth 1.0a — encodeURIComponent misses !*'())
+function rfc3986(str) {
+  return encodeURIComponent(str).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+}
+
 function oauthSign(method, url, params, consumerKey, consumerSecret, tokenKey, tokenSecret) {
   const oauthParams = {
     oauth_consumer_key: consumerKey,
@@ -833,14 +910,14 @@ function oauthSign(method, url, params, consumerKey, consumerSecret, tokenKey, t
     ...params
   };
   const sorted = Object.keys(oauthParams).sort().map(k =>
-    encodeURIComponent(k) + '=' + encodeURIComponent(oauthParams[k])
+    rfc3986(k) + '=' + rfc3986(oauthParams[k])
   ).join('&');
-  const base = method.toUpperCase() + '&' + encodeURIComponent(url) + '&' + encodeURIComponent(sorted);
-  const signingKey = encodeURIComponent(consumerSecret) + '&' + encodeURIComponent(tokenSecret);
+  const base = method.toUpperCase() + '&' + rfc3986(url) + '&' + rfc3986(sorted);
+  const signingKey = rfc3986(consumerSecret) + '&' + rfc3986(tokenSecret);
   const sig = crypto.createHmac('sha1', signingKey).update(base).digest('base64');
   oauthParams.oauth_signature = sig;
-  const header = 'OAuth ' + Object.keys(oauthParams).sort().map(k =>
-    encodeURIComponent(k) + '="' + encodeURIComponent(oauthParams[k]) + '"'
+  const header = 'OAuth ' + Object.keys(oauthParams).filter(k => k.startsWith('oauth_')).sort().map(k =>
+    rfc3986(k) + '="' + rfc3986(oauthParams[k]) + '"'
   ).join(', ');
   return header;
 }
@@ -854,11 +931,11 @@ function postLunariBuildTweet(siteUrl, siteName, userHandle) {
   const authHeader = oauthSign('POST', tweetUrl, {}, TWITTER.API_KEY, TWITTER.API_SECRET, TWITTER.LUNARI_TOKEN, TWITTER.LUNARI_SECRET);
   const opts = {
     hostname: 'api.twitter.com', path: '/2/tweets', method: 'POST',
-    headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+    headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), 'User-Agent': 'LUNARI/1.0' }
   };
   const req = https.request(opts, res => {
     let d = ''; res.on('data', c => d += c);
-    res.on('end', () => console.log('[LUNARI TWEET] status:', res.statusCode, d.slice(0,100)));
+    res.on('end', () => console.log('[LUNARI TWEET] status:', res.statusCode, d.slice(0,200)));
   });
   req.on('error', e => console.error('[LUNARI TWEET] error:', e.message));
   req.write(body); req.end();
