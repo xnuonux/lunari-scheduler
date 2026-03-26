@@ -534,18 +534,17 @@ function tick() {
 // Send morning briefs to all opted-in users
 async function sendMorningBriefs() {
   console.log('[BRIEFS] Sending morning briefs...');
-  const users = await sbFetch('GET', 'user_credits?select=user_id&limit=500').catch(() => null);
-  if (!users || !users.length) return;
-
-  // Get emails from auth — use service key
+  // Get all users who have opted in and have an email stored
+  const users = await sbFetch('GET', 'user_credits?morning_brief=eq.true&email=not.is.null&select=user_id,email&limit=500').catch(() => null);
+  if (!users || !users.length) {
+    console.log('[BRIEFS] No opted-in users found');
+    return;
+  }
+  console.log('[BRIEFS] Sending to', users.length, 'users');
   for (const u of users) {
     try {
-      const emailRes = await sbAdmin('GET', `auth/users?id=eq.${u.user_id}&select=email&limit=1`).catch(() => null);
-      // Fallback: get from gmail_tokens table
-      const gmailRes = await sbAdmin('GET', `gmail_tokens?user_id=eq.${u.user_id}&select=email&limit=1`).catch(() => null);
-      const email = (gmailRes && gmailRes[0]) ? gmailRes[0].email : null;
-      if (email) {
-        await sendMorningBrief(email, u.user_id);
+      if (u.email) {
+        await sendMorningBrief(u.email, u.user_id);
         await new Promise(r => setTimeout(r, 500)); // rate limit
       }
     } catch(e) { console.error('[BRIEFS] User error:', e.message); }
@@ -1012,6 +1011,18 @@ async function saveToGoogleDocs(userId, title, content, category) {
 
   // ── EMAIL API ─────────────────────────────────────
 
+  // General send endpoint — for NOVA sending emails via Resend
+  if(req.method==='POST'&&url==='/email/send'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try{
+        const{toEmail,subject,body,agent}=JSON.parse(b);
+        if(!toEmail||!subject||!body){res.writeHead(400);return res.end(JSON.stringify({error:'Missing fields'}));}
+        const ok=await sendEmail(toEmail,subject,body,agent||'nova');
+        res.writeHead(200);res.end(JSON.stringify({ok}));
+      }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
+    });return;
+  }
+
   // Test email endpoint
   if(req.method==='POST'&&url==='/email/test'){
     let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
@@ -1309,18 +1320,39 @@ async function saveToGoogleDocs(userId, title, content, category) {
                 plan: mapping.plan,
                 credits: mapping.credits,
                 site_limit: mapping.site_limit,
+                email: customerEmail || null,
+                morning_brief: true, // auto-enable for paid plans
                 updated_at: new Date().toISOString()
               });
               console.log('[STRIPE] ✓ Plan updated to', mapping.plan, 'for', userId);
+              // Send upgrade confirmation email
+              if (customerEmail) {
+                await sendEmail(
+                  customerEmail,
+                  `🌙 You're now on LUNARI ${mapping.plan.charAt(0).toUpperCase() + mapping.plan.slice(1)}`,
+                  `welcome to the ${mapping.plan} plan.\n\nyou now have ${mapping.credits} Fuel and ${mapping.site_limit} site${mapping.site_limit > 1 ? 's' : ''}.\n\nthe crew is ready. let's build something.\n\n— RAVEN`,
+                  'raven'
+                );
+              }
             } else {
               // Fuel pack — add to existing balance
               const current = await sbFetch('GET', `user_credits?user_id=eq.${userId}&select=credits&limit=1`).catch(() => null);
               const currentCredits = (current && current[0]) ? (current[0].credits || 0) : 0;
               await sbFetch('PATCH', `user_credits?user_id=eq.${userId}`, {
                 credits: currentCredits + mapping.credits,
+                email: customerEmail || null,
                 updated_at: new Date().toISOString()
               });
               console.log('[STRIPE] ✓ Added', mapping.credits, 'Fuel →', currentCredits + mapping.credits, 'total for', userId);
+              // Send fuel confirmation email
+              if (customerEmail) {
+                await sendEmail(
+                  customerEmail,
+                  `⚡ ${mapping.credits} Fuel added to your LUNARI account`,
+                  `your fuel pack landed.\n\nyou now have ${currentCredits + mapping.credits} Fuel total.\n\nfuel burns when you build. chat is always free.\n\ngo build something.\n\n— RAVEN`,
+                  'raven'
+                );
+              }
             }
           } else if (!userId) {
             console.log('[STRIPE] No client_reference_id — user was not logged in at checkout');
