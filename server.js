@@ -529,9 +529,89 @@ function tick() {
   if (now.getHours() === 8 && now.getMinutes() === 0) {
     sendMorningBriefs().catch(e => console.error('[BRIEFS]', e.message));
   }
+
+  // Daily outreach — fire at 9am, write + send for all active users
+  if (now.getHours() === 9 && now.getMinutes() === 0) {
+    runDailyOutreach().catch(e => console.error('[OUTREACH TICK]', e.message));
+  }
 }
 
-// Send morning briefs to all opted-in users
+// Daily outreach — write + send 10 emails per opted-in user
+async function runDailyOutreach() {
+  console.log('[OUTREACH] Running daily outreach...');
+  // Get users who have pending contacts
+  const users = await sbFetch('GET',
+    'outreach_contacts?status=eq.pending&select=user_id&order=user_id'
+  ).catch(() => null);
+  if (!users || !users.length) return;
+
+  // Dedupe user IDs
+  const userIds = [...new Set(users.map(u => u.user_id))];
+  console.log('[OUTREACH] Processing', userIds.length, 'users');
+
+  for (const userId of userIds) {
+    try {
+      // Write emails for contacts that don't have them yet
+      const pending = await sbFetch('GET',
+        `outreach_contacts?user_id=eq.${userId}&status=eq.pending&email_subject=is.null&limit=10`
+      ).catch(() => null);
+
+      if (pending && pending.length > 0) {
+        // Write emails
+        for (const contact of pending.slice(0, 10)) {
+          const emailPrompt = `You are NOVA. Write a short cold outreach email.
+Recipient: ${contact.name} (${contact.title}) at ${contact.company}
+Context: ${contact.notes || 'potential client'}
+Rules: under 100 words, specific, human, one CTA.
+Return ONLY JSON: {"subject":"...","body":"..."}`;
+
+          const raw = await callClaude('nova', emailPrompt, CONFIG.ANTHROPIC_KEY);
+          try {
+            const m = raw.match(/\{[\s\S]*\}/);
+            if (m) {
+              const email = JSON.parse(m[0]);
+              await sbFetch('PATCH',
+                `outreach_contacts?id=eq.${contact.id}`,
+                { email_subject: email.subject, email_body: email.body }
+              );
+            }
+          } catch(e) {}
+          await new Promise(r => setTimeout(r, 300));
+        }
+      }
+
+      // Now send today's batch
+      const today = new Date().toISOString().split('T')[0];
+      const sentToday = await sbFetch('GET',
+        `outreach_contacts?user_id=eq.${userId}&status=eq.sent&sent_at=gte.${today}T00:00:00&select=id`
+      ).catch(() => null);
+      const remaining = Math.max(0, 10 - (sentToday ? sentToday.length : 0));
+      if (remaining === 0) continue;
+
+      const ready = await sbFetch('GET',
+        `outreach_contacts?user_id=eq.${userId}&status=eq.pending&email_subject=not.is.null&limit=${remaining}`
+      ).catch(() => null);
+
+      if (!ready || !ready.length) continue;
+
+      let sent = 0;
+      for (const contact of ready) {
+        const ok = await sendEmail(contact.email, contact.email_subject, contact.email_body, 'nova');
+        if (ok) {
+          await sbFetch('PATCH',
+            `outreach_contacts?id=eq.${contact.id}`,
+            { status: 'sent', sent_at: new Date().toISOString() }
+          );
+          sent++;
+        }
+        await new Promise(r => setTimeout(r, 500));
+      }
+      console.log('[OUTREACH]', userId, '→', sent, 'emails sent');
+    } catch(e) {
+      console.error('[OUTREACH] User error:', userId, e.message);
+    }
+  }
+}
 async function sendMorningBriefs() {
   console.log('[BRIEFS] Sending morning briefs...');
   // Get all users who have opted in and have an email stored
@@ -1008,6 +1088,202 @@ async function saveToGoogleDocs(userId, title, content, category) {
     return { ok: false, error: e.message };
   }
 }
+
+  // ── CONTACT RESEARCH + OUTREACH ──────────────────
+
+  // Research contacts — ATLAS finds real people via web search
+  if(req.method==='POST'&&url==='/outreach/research'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try{
+        const{userId,industry,niche,count=10}=JSON.parse(b);
+        if(!userId||!industry){res.writeHead(400);return res.end(JSON.stringify({error:'Missing fields'}));}
+
+        console.log('[OUTREACH] Researching contacts for',userId,'in',industry);
+
+        // ATLAS researches via Claude with web search awareness
+        const researchPrompt = `You are ATLAS, research agent at LUNARI. Find ${count} real potential business contacts in the ${industry} industry${niche ? ` specifically in ${niche}` : ''}.
+
+For each contact provide:
+- Full name
+- Company name
+- Job title (decision maker: founder, CEO, CMO, Head of Marketing, etc.)
+- Company website or LinkedIn URL
+- Why they'd benefit from AI tools
+
+Return ONLY valid JSON array, no markdown, no explanation:
+[
+  {
+    "name": "First Last",
+    "company": "Company Name",
+    "title": "Job Title",
+    "email": "guessed@company.com",
+    "source": "linkedin.com/company/...",
+    "notes": "One sentence why they're a good fit"
+  }
+]
+
+Make realistic email guesses based on the company domain (firstname@company.com or firstname.lastname@company.com). Focus on companies with 5-200 employees. Be specific and realistic.`;
+
+        const raw = await callClaude('atlas', researchPrompt, CONFIG.ANTHROPIC_KEY);
+
+        // Parse JSON from response
+        let contacts = [];
+        try {
+          const jsonMatch = raw.match(/\[[\s\S]*\]/);
+          if (jsonMatch) contacts = JSON.parse(jsonMatch[0]);
+        } catch(e) {
+          console.error('[OUTREACH] JSON parse error:', e.message);
+          return res.end(JSON.stringify({ok:false,error:'Could not parse contacts'}));
+        }
+
+        // Store in Supabase
+        let saved = 0;
+        for (const c of contacts.slice(0, count)) {
+          const result = await sbFetch('POST', 'outreach_contacts', {
+            user_id: userId,
+            name: c.name || '',
+            company: c.company || '',
+            title: c.title || '',
+            email: c.email || '',
+            source: c.source || '',
+            industry: industry,
+            notes: c.notes || '',
+            status: 'pending'
+          }).catch(() => null);
+          if (result) saved++;
+        }
+
+        console.log('[OUTREACH] Saved', saved, 'contacts for', userId);
+        res.writeHead(200);res.end(JSON.stringify({ok:true,contacts:contacts.slice(0,count),saved}));
+      }catch(e){
+        console.error('[OUTREACH] Research error:',e.message);
+        res.writeHead(500);res.end(JSON.stringify({error:e.message}));
+      }
+    });return;
+  }
+
+  // Write outreach emails for pending contacts
+  if(req.method==='POST'&&url==='/outreach/write'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try{
+        const{userId,context=''}=JSON.parse(b);
+        if(!userId){res.writeHead(400);return res.end(JSON.stringify({error:'Missing userId'}));}
+
+        // Get pending contacts without emails written yet
+        const contacts = await sbFetch('GET',
+          `outreach_contacts?user_id=eq.${userId}&status=eq.pending&email_subject=is.null&limit=10`
+        ).catch(()=>null);
+
+        if(!contacts||!contacts.length){
+          res.writeHead(200);return res.end(JSON.stringify({ok:true,written:0,message:'No pending contacts'}));
+        }
+
+        // Get user's business context
+        const userCredits = await sbFetch('GET',`user_credits?user_id=eq.${userId}&select=email&limit=1`).catch(()=>null);
+        const senderEmail = (userCredits&&userCredits[0])?userCredits[0].email:'';
+
+        let written = 0;
+        for (const contact of contacts) {
+          const emailPrompt = `You are NOVA, writing a cold outreach email for a LUNARI user.
+
+Sender context: ${context || 'AI-powered business tools user'}
+Recipient: ${contact.name} (${contact.title}) at ${contact.company}
+Notes: ${contact.notes}
+
+Write a short, personalized cold email. Rules:
+- Subject line under 8 words
+- Body under 120 words
+- Reference their specific company/role
+- Clear single CTA
+- Natural, human tone — not salesy
+- No generic phrases like "I hope this finds you well"
+
+Return ONLY valid JSON:
+{"subject": "...", "body": "..."}`;
+
+          const raw = await callClaude('nova', emailPrompt, CONFIG.ANTHROPIC_KEY);
+          try {
+            const jsonMatch = raw.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+              const email = JSON.parse(jsonMatch[0]);
+              await sbFetch('PATCH',
+                `outreach_contacts?id=eq.${contact.id}&user_id=eq.${userId}`,
+                { email_subject: email.subject, email_body: email.body }
+              );
+              written++;
+            }
+          } catch(e) { console.error('[OUTREACH] Email write error:', e.message); }
+        }
+
+        console.log('[OUTREACH] Wrote', written, 'emails for', userId);
+        res.writeHead(200);res.end(JSON.stringify({ok:true,written}));
+      }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
+    });return;
+  }
+
+  // Send today's batch — max 10 per user per day
+  if(req.method==='POST'&&url==='/outreach/send'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try{
+        const{userId}=JSON.parse(b);
+        if(!userId){res.writeHead(400);return res.end(JSON.stringify({error:'Missing userId'}));}
+
+        // Check how many sent today already
+        const today = new Date().toISOString().split('T')[0];
+        const sentToday = await sbFetch('GET',
+          `outreach_contacts?user_id=eq.${userId}&status=eq.sent&sent_at=gte.${today}T00:00:00&select=id`
+        ).catch(()=>null);
+        const sentCount = sentToday ? sentToday.length : 0;
+        const remaining = Math.max(0, 10 - sentCount);
+
+        if (remaining === 0) {
+          res.writeHead(200);return res.end(JSON.stringify({ok:true,sent:0,message:'Daily limit reached (10/day)'}));
+        }
+
+        // Get ready-to-send contacts (have email written, not sent yet)
+        const ready = await sbFetch('GET',
+          `outreach_contacts?user_id=eq.${userId}&status=eq.pending&email_subject=not.is.null&email_body=not.is.null&limit=${remaining}`
+        ).catch(()=>null);
+
+        if(!ready||!ready.length){
+          res.writeHead(200);return res.end(JSON.stringify({ok:true,sent:0,message:'No emails ready to send — run write first'}));
+        }
+
+        let sent = 0;
+        for (const contact of ready) {
+          const ok = await sendEmail(
+            contact.email,
+            contact.email_subject,
+            contact.email_body,
+            'nova'
+          );
+          if (ok) {
+            await sbFetch('PATCH',
+              `outreach_contacts?id=eq.${contact.id}&user_id=eq.${userId}`,
+              { status: 'sent', sent_at: new Date().toISOString() }
+            );
+            sent++;
+            await new Promise(r => setTimeout(r, 500)); // rate limit
+          }
+        }
+
+        console.log('[OUTREACH] Sent', sent, 'emails for', userId);
+        res.writeHead(200);res.end(JSON.stringify({ok:true,sent,remaining:remaining-sent}));
+      }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
+    });return;
+  }
+
+  // List contacts for a user
+  if(req.method==='GET'&&url.startsWith('/outreach/contacts')){
+    const params=new URLSearchParams(req.url.split('?')[1]||'');
+    const userId=params.get('userId')||'';
+    (async()=>{
+      const rows=await sbFetch('GET',
+        `outreach_contacts?user_id=eq.${userId}&order=created_at.desc&limit=50`
+      ).catch(()=>[]);
+      res.writeHead(200);res.end(JSON.stringify({contacts:rows||[]}));
+    })();return;
+  }
 
   // ── EMAIL API ─────────────────────────────────────
 
