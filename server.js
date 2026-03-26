@@ -11,9 +11,8 @@ const CONFIG = {
   SUPABASE_SERVICE_KEY:  process.env.SUPABASE_SERVICE_KEY     || '',
   STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET    || '',
   TELEGRAM_TOKEN:        process.env.TELEGRAM_BOT_TOKEN       || '',
-  EMAILJS_SERVICE:       process.env.EMAILJS_SERVICE_ID       || 'service_3d0r898',
-  EMAILJS_TEMPLATE:      process.env.EMAILJS_TEMPLATE_ID      || 'template_j4ecn66',
-  EMAILJS_KEY:           process.env.EMAILJS_PUBLIC_KEY       || 'SnGkSaX1ThQBSysOU',
+  RESEND_API_KEY:        process.env.RESEND_API_KEY           || '',
+  FROM_EMAIL:            'LUNARI <system@lunari.pro>',
   PORT:                  process.env.PORT                     || 3000,
 };
 
@@ -359,11 +358,199 @@ const AGENT_SYSTEMS={
 function callClaude(agent,prompt,apiKey){return new Promise((resolve,reject)=>{const b=JSON.stringify({model:'claude-sonnet-4-6',max_tokens:1500,system:AGENT_SYSTEMS[agent]||AGENT_SYSTEMS.raven,messages:[{role:'user',content:prompt}]});const o={hostname:'api.anthropic.com',path:'/v1/messages',method:'POST',headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','Content-Length':Buffer.byteLength(b)}};const r=https.request(o,res=>{let d='';res.on('data',c=>d+=c);res.on('end',()=>{try{const p=JSON.parse(d);if(p.error)return reject(new Error(p.error.message));resolve(p.content.filter(b=>b.type==='text').map(b=>b.text).join(''));}catch(e){reject(e);}});});r.on('error',reject);r.write(b);r.end();});}
 
 // ── Email ────────────────────────────────────────
-function sendEmail(toEmail,subject,body,agentName){return new Promise((resolve)=>{const p=JSON.stringify({service_id:CONFIG.EMAILJS_SERVICE,template_id:CONFIG.EMAILJS_TEMPLATE,user_id:CONFIG.EMAILJS_KEY,template_params:{to_email:toEmail,subject,body:body.replace(/\*\*/g,'').replace(/\*/g,'').replace(/#+\s/g,''),agent:(agentName||'LUNARI').toUpperCase()}});const o={hostname:'api.emailjs.com',path:'/api/v1.0/email/send',method:'POST',headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(p),'origin':'https://lunari.pro'}};const r=https.request(o,res=>{res.on('data',()=>{});res.on('end',()=>resolve(res.statusCode===200));});r.on('error',()=>resolve(false));r.write(p);r.end();});}
+// ── Email via Resend ──────────────────────────────
+const AGENT_COLORS = {
+  raven: '#dce3f0', nova: '#c9a84c', atlas: '#9e1e36',
+  gen: '#7a1528', x: '#4a5060', system: '#c9a84c'
+};
+
+const AGENT_EMOJIS = {
+  raven: '🪶', nova: '✨', atlas: '🗺️', gen: '🌀', x: '✕', system: '🌙'
+};
+
+function buildEmailHtml(subject, body, agentName) {
+  const agent = (agentName || 'system').toLowerCase();
+  const color = AGENT_COLORS[agent] || '#c9a84c';
+  const emoji = AGENT_EMOJIS[agent] || '🌙';
+  const name = (agentName || 'LUNARI').toUpperCase();
+
+  // Convert markdown-ish text to HTML
+  const htmlBody = body
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+    .replace(/#{1,6}\s(.+)/g, '<h3 style="color:#dce3f0;margin:20px 0 8px;">$1</h3>')
+    .replace(/\n\n/g, '</p><p style="margin:0 0 16px;line-height:1.7;">')
+    .replace(/\n/g, '<br>')
+    .replace(/^/, '<p style="margin:0 0 16px;line-height:1.7;">')
+    .replace(/$/, '</p>');
+
+  return `<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#08090e;font-family:'DM Sans',Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#08090e;padding:40px 20px;">
+    <tr><td align="center">
+      <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
+
+        <!-- Header -->
+        <tr><td style="padding-bottom:32px;">
+          <table width="100%" cellpadding="0" cellspacing="0">
+            <tr>
+              <td>
+                <span style="color:#c9a84c;font-size:20px;font-weight:800;letter-spacing:-0.5px;">● LUNARI</span>
+              </td>
+              <td align="right">
+                <span style="color:#4a5060;font-size:11px;font-family:monospace;letter-spacing:1px;">lunari.pro</span>
+              </td>
+            </tr>
+          </table>
+        </td></tr>
+
+        <!-- Agent badge -->
+        <tr><td style="padding-bottom:20px;">
+          <span style="display:inline-block;background:rgba(255,255,255,0.05);border:1px solid ${color}33;border-radius:20px;padding:6px 14px;font-size:11px;font-family:monospace;letter-spacing:1.5px;color:${color};">
+            ${emoji} ${name}
+          </span>
+        </td></tr>
+
+        <!-- Subject -->
+        <tr><td style="padding-bottom:24px;">
+          <h1 style="margin:0;color:#dce3f0;font-size:24px;font-weight:700;line-height:1.3;">${subject}</h1>
+        </td></tr>
+
+        <!-- Body -->
+        <tr><td style="background:#0d0e14;border:1px solid #1a1b22;border-radius:12px;padding:28px;color:#a0a8b8;font-size:15px;line-height:1.7;">
+          ${htmlBody}
+        </td></tr>
+
+        <!-- CTA -->
+        <tr><td style="padding-top:28px;text-align:center;">
+          <a href="https://lunari.pro" style="display:inline-block;background:#c9a84c;color:#08090e;text-decoration:none;padding:12px 28px;border-radius:8px;font-weight:700;font-size:14px;letter-spacing:0.5px;">
+            Open LUNARI →
+          </a>
+        </td></tr>
+
+        <!-- Footer -->
+        <tr><td style="padding-top:32px;text-align:center;color:#2a2b35;font-size:11px;font-family:monospace;">
+          LUNARI · lunari.pro · you're receiving this because you're part of the crew
+        </td></tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+}
+
+function sendEmail(toEmail, subject, body, agentName) {
+  return new Promise((resolve) => {
+    if (!CONFIG.RESEND_API_KEY) {
+      console.error('[EMAIL] No Resend API key');
+      return resolve(false);
+    }
+
+    const html = buildEmailHtml(subject, body, agentName);
+    const payload = JSON.stringify({
+      from: CONFIG.FROM_EMAIL,
+      to: [toEmail],
+      subject: subject,
+      html: html,
+      text: body.replace(/\*\*/g,'').replace(/\*/g,'').replace(/#+\s/g,'')
+    });
+
+    const opts = {
+      hostname: 'api.resend.com',
+      path: '/emails',
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + CONFIG.RESEND_API_KEY,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    };
+
+    const req = https.request(opts, res => {
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => {
+        try {
+          const r = JSON.parse(d);
+          if (res.statusCode === 200 || res.statusCode === 201) {
+            console.log('[EMAIL] Sent to', toEmail, '— id:', r.id);
+            resolve(true);
+          } else {
+            console.error('[EMAIL] Failed:', res.statusCode, d);
+            resolve(false);
+          }
+        } catch(e) { resolve(false); }
+      });
+    });
+    req.on('error', (e) => { console.error('[EMAIL] Error:', e.message); resolve(false); });
+    req.write(payload);
+    req.end();
+  });
+}
+
+// Send a morning brief email
+async function sendMorningBrief(userEmail, userId) {
+  if (!userEmail || !CONFIG.RESEND_API_KEY) return;
+  try {
+    // Get user's recent context
+    const history = await sbFetch('GET', `chat_history?user_id=eq.${userId}&select=messages&limit=1`).catch(() => null);
+    const messages = (history && history[0] && history[0].messages) || [];
+    const recentContext = messages.slice(-6).map(m =>
+      `${m.role === 'user' ? 'User' : 'Crew'}: ${m.content.slice(0, 100)}`
+    ).join('\n');
+
+    const credits = await sbFetch('GET', `user_credits?user_id=eq.${userId}&select=credits,plan&limit=1`).catch(() => null);
+    const fuel = (credits && credits[0]) ? credits[0].credits : 0;
+    const plan = (credits && credits[0]) ? credits[0].plan : 'free';
+
+    const briefPrompt = recentContext
+      ? `You are RAVEN, lead agent at LUNARI. Write a short morning brief for this user based on their recent activity. Keep it under 150 words, warm but direct. Sign off as RAVEN.\n\nRecent activity:\n${recentContext}\n\nThey have ${fuel} Fuel remaining on the ${plan} plan.`
+      : `You are RAVEN, lead agent at LUNARI. Write a short morning brief for a new user who hasn't chatted much yet. Welcome them, remind them what the crew can do, and give them one specific thing to try today. Under 150 words. Sign off as RAVEN.`;
+
+    const brief = await callClaude('raven', briefPrompt, CONFIG.ANTHROPIC_KEY);
+    const today = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+
+    await sendEmail(userEmail, `🌙 RAVEN's Morning Brief — ${today}`, brief, 'raven');
+    console.log('[BRIEF] Sent to', userEmail);
+  } catch(e) {
+    console.error('[BRIEF] Error:', e.message);
+  }
+}
 
 // ── Schedule runner ──────────────────────────────
 async function runSchedule(s){if(!s.enabled||!s.email||!CONFIG.ANTHROPIC_KEY)return;try{const r=await callClaude(s.agent,s.prompt,CONFIG.ANTHROPIC_KEY);await sendEmail(s.email,'LUNARI · '+s.name+' · '+new Date().toLocaleDateString(),r,s.agent);s.lastRun=new Date().toISOString();s.nextRun=getNextRun(s.schedule);}catch(e){console.error('[SCHEDULE]',e.message);}}
-function tick(){const now=new Date();SCHEDULES.forEach(s=>{if(cronMatches(s.schedule,now))runSchedule(s);});}
+function tick() {
+  const now = new Date();
+  SCHEDULES.forEach(s => { if(cronMatches(s.schedule, now)) runSchedule(s); });
+
+  // Morning briefs — fire at 8am daily
+  if (now.getHours() === 8 && now.getMinutes() === 0) {
+    sendMorningBriefs().catch(e => console.error('[BRIEFS]', e.message));
+  }
+}
+
+// Send morning briefs to all opted-in users
+async function sendMorningBriefs() {
+  console.log('[BRIEFS] Sending morning briefs...');
+  const users = await sbFetch('GET', 'user_credits?select=user_id&limit=500').catch(() => null);
+  if (!users || !users.length) return;
+
+  // Get emails from auth — use service key
+  for (const u of users) {
+    try {
+      const emailRes = await sbAdmin('GET', `auth/users?id=eq.${u.user_id}&select=email&limit=1`).catch(() => null);
+      // Fallback: get from gmail_tokens table
+      const gmailRes = await sbAdmin('GET', `gmail_tokens?user_id=eq.${u.user_id}&select=email&limit=1`).catch(() => null);
+      const email = (gmailRes && gmailRes[0]) ? gmailRes[0].email : null;
+      if (email) {
+        await sendMorningBrief(email, u.user_id);
+        await new Promise(r => setTimeout(r, 500)); // rate limit
+      }
+    } catch(e) { console.error('[BRIEFS] User error:', e.message); }
+  }
+}
 
 // ── HTTP handler ─────────────────────────────────
 function handleRequest(req,res){
@@ -822,6 +1009,37 @@ async function saveToGoogleDocs(userId, title, content, category) {
     return { ok: false, error: e.message };
   }
 }
+
+  // ── EMAIL API ─────────────────────────────────────
+
+  // Test email endpoint
+  if(req.method==='POST'&&url==='/email/test'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try{
+        const{toEmail,userId}=JSON.parse(b);
+        if(!toEmail){res.writeHead(400);return res.end(JSON.stringify({error:'Missing email'}));}
+        const ok = await sendEmail(
+          toEmail,
+          '🌙 Welcome to LUNARI — the crew is ready',
+          `hey.\n\nRAVEN here. you just got a crew of five AI agents.\n\nwe write, research, strategize, build, and execute — on command, in seconds.\n\nchat is free forever. Fuel only burns when you build something.\n\nyour first site is on us.\n\nlet's get to work.\n\n— RAVEN`,
+          'raven'
+        );
+        res.writeHead(200);res.end(JSON.stringify({ok}));
+      }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
+    });return;
+  }
+
+  // Send morning brief on demand
+  if(req.method==='POST'&&url==='/email/brief'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try{
+        const{toEmail,userId}=JSON.parse(b);
+        if(!toEmail||!userId){res.writeHead(400);return res.end(JSON.stringify({error:'Missing fields'}));}
+        await sendMorningBrief(toEmail,userId);
+        res.writeHead(200);res.end(JSON.stringify({ok:true}));
+      }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
+    });return;
+  }
 
   // ── TELEGRAM LINK API ────────────────────────────
   // Complete account link from web app
