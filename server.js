@@ -833,6 +833,7 @@ async function saveToGoogleDocs(userId, title, content, category) {
 
         // Find the pending link
         const rows=await sbAdmin('GET',`telegram_links?link_code=eq.${code.toUpperCase()}&select=telegram_chat_id,telegram_username&limit=1`).catch(()=>null);
+        console.log('[TG LINK] Code lookup for', code.toUpperCase(), ':', JSON.stringify(rows));
         if(!rows||!rows[0]){res.writeHead(200);return res.end(JSON.stringify({ok:false,error:'Invalid or expired code'}));}
 
         const{telegram_chat_id,telegram_username}=rows[0];
@@ -1475,18 +1476,22 @@ async function handleTgMessage(msg) {
     // Generate a link code and store it temporarily
     const code = genLinkCode();
     // Store with null user_id temporarily — web will complete the link
-    await sbAdmin('POST', 'telegram_links', {
+    // Try insert first, fall back to update if row exists
+    const insertRes = await sbAdmin('POST', 'telegram_links', {
       telegram_chat_id: chatId,
       telegram_username: tgUsername,
-      link_code: code,
-      user_id: '00000000-0000-0000-0000-000000000000' // placeholder
-    }).catch(async () => {
-      // Already exists — update the code
-      await sbAdmin('PATCH', `telegram_links?telegram_chat_id=eq.${chatId}`, {
-        link_code: code,
-        telegram_username: tgUsername
-      });
+      link_code: code
     });
+    console.log('[TG LINK] Insert result:', JSON.stringify(insertRes));
+    if (!insertRes || (Array.isArray(insertRes) && !insertRes.length) || insertRes.code) {
+      // Row exists — update the code
+      const patchRes = await sbAdmin('PATCH', `telegram_links?telegram_chat_id=eq.${chatId}`, {
+        link_code: code,
+        telegram_username: tgUsername,
+        user_id: null
+      });
+      console.log('[TG LINK] Patch result:', JSON.stringify(patchRes));
+    }
     await tgSend(chatId,
       `🔗 *link your lunari.pro account*\n\n` +
       `your link code: \`${code}\`\n\n` +
