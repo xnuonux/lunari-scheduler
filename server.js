@@ -10,6 +10,7 @@ const CONFIG = {
   SUPABASE_KEY:          process.env.SUPABASE_KEY             || '',
   SUPABASE_SERVICE_KEY:  process.env.SUPABASE_SERVICE_KEY     || '',
   STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET    || '',
+  TELEGRAM_TOKEN:        process.env.TELEGRAM_BOT_TOKEN       || '',
   EMAILJS_SERVICE:       process.env.EMAILJS_SERVICE_ID       || 'service_3d0r898',
   EMAILJS_TEMPLATE:      process.env.EMAILJS_TEMPLATE_ID      || 'template_j4ecn66',
   EMAILJS_KEY:           process.env.EMAILJS_PUBLIC_KEY       || 'SnGkSaX1ThQBSysOU',
@@ -1218,3 +1219,220 @@ server.listen(CONFIG.PORT,()=>{
 
 setInterval(tick, 60*1000);
 setInterval(processJobs, 30*1000); // check for new jobs every 30s
+
+// ── TELEGRAM BOT ──────────────────────────────────
+const TG_SESSIONS = {}; // in-memory chat sessions keyed by chatId
+let tgOffset = 0;
+
+const AGENT_SYSTEMS_TG = {
+  raven: 'You are RAVEN, lead agent of LUNARI. You\'re talking to a user via Telegram. Be direct, sharp, and genuinely helpful. You can route tasks to other agents by saying "let me get ATLAS/NOVA/GEN/X on that." Keep responses concise for mobile — under 400 words unless they need more.',
+  nova: 'You are NOVA, content agent of LUNARI. On Telegram. Write full drafts, never outlines. Warm, vivid, direct.',
+  atlas: 'You are ATLAS, research agent of LUNARI. On Telegram. Surface what matters most, lead with insights.',
+  gen: 'You are GEN, marketing agent of LUNARI. On Telegram. Bold, direct strategy. No hedging.',
+  x: 'You are X, task router of LUNARI. On Telegram. One or two sentences max.'
+};
+
+function tgRequest(method, body) {
+  return new Promise((resolve, reject) => {
+    const bodyStr = JSON.stringify(body);
+    const opts = {
+      hostname: 'api.telegram.org',
+      path: `/bot${CONFIG.TELEGRAM_TOKEN}/${method}`,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(bodyStr) }
+    };
+    const req = https.request(opts, res => {
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve({}); } });
+    });
+    req.on('error', reject);
+    req.write(bodyStr); req.end();
+  });
+}
+
+function tgSend(chatId, text) {
+  // Split long messages for Telegram's 4096 char limit
+  const chunks = [];
+  let remaining = text;
+  while (remaining.length > 4000) {
+    let split = remaining.lastIndexOf('\n', 4000);
+    if (split < 0) split = 4000;
+    chunks.push(remaining.slice(0, split));
+    remaining = remaining.slice(split);
+  }
+  chunks.push(remaining);
+
+  return chunks.reduce((p, chunk) => p.then(() =>
+    tgRequest('sendMessage', {
+      chat_id: chatId,
+      text: chunk,
+      parse_mode: 'Markdown'
+    })
+  ), Promise.resolve());
+}
+
+function detectTgAgent(text) {
+  const lower = text.toLowerCase();
+  if (lower.includes('@nova') || lower.includes('write') || lower.includes('draft')) return 'nova';
+  if (lower.includes('@atlas') || lower.includes('research') || lower.includes('find')) return 'atlas';
+  if (lower.includes('@gen') || lower.includes('strategy') || lower.includes('market')) return 'gen';
+  if (lower.includes('@x') || lower.includes('quick') || lower.includes('short')) return 'x';
+  return 'raven';
+}
+
+async function handleTgMessage(msg) {
+  const chatId = msg.chat.id;
+  const text = msg.text || '';
+  const username = msg.from && msg.from.username ? msg.from.username : (msg.from && msg.from.first_name ? msg.from.first_name : 'there');
+
+  // Init session
+  if (!TG_SESSIONS[chatId]) {
+    TG_SESSIONS[chatId] = { messages: [], agent: 'raven', userId: null };
+  }
+  const session = TG_SESSIONS[chatId];
+
+  // Commands
+  if (text === '/start') {
+    await tgSend(chatId,
+      `🌙 *welcome to LUNARI, ${username}.*\n\n` +
+      `you just got a crew of five AI agents:\n` +
+      `🪶 *RAVEN* — lead agent\n` +
+      `✨ *NOVA* — writing & content\n` +
+      `🗺️ *ATLAS* — research & intel\n` +
+      `🌀 *GEN* — marketing strategy\n` +
+      `✕ *X* — quick answers\n\n` +
+      `just talk to me. or use @nova, @atlas, @gen, @x to route directly.\n\n` +
+      `chat is free. what are we working on?`
+    );
+    return;
+  }
+
+  if (text === '/help') {
+    await tgSend(chatId,
+      `*LUNARI crew commands:*\n\n` +
+      `Just type naturally — RAVEN routes your request.\n\n` +
+      `@nova — writing, copy, emails\n` +
+      `@atlas — research, competitors, intel\n` +
+      `@gen — strategy, marketing, growth\n` +
+      `@x — quick one-liner answers\n\n` +
+      `/clear — clear conversation memory\n` +
+      `/status — check your account\n` +
+      `/web — go to lunari.pro`
+    );
+    return;
+  }
+
+  if (text === '/clear') {
+    session.messages = [];
+    await tgSend(chatId, '🌙 memory cleared. fresh start.');
+    return;
+  }
+
+  if (text === '/web') {
+    await tgSend(chatId, '🌐 lunari.pro — your full crew is there too.');
+    return;
+  }
+
+  if (text === '/status') {
+    await tgSend(chatId, `✕ you're connected to LUNARI via Telegram.\n\ncreate an account at lunari.pro to track your Fuel, builds, and history across devices.`);
+    return;
+  }
+
+  // Show typing indicator
+  await tgRequest('sendChatAction', { chat_id: chatId, action: 'typing' });
+
+  // Detect agent and build message history
+  const agentId = detectTgAgent(text);
+  const system = AGENT_SYSTEMS_TG[agentId];
+
+  session.messages.push({ role: 'user', content: text });
+  const trimmed = session.messages.slice(-12); // keep last 12 for context
+
+  try {
+    // Call Claude
+    const bodyStr = JSON.stringify({
+      model: agentId === 'raven' ? 'claude-opus-4-6' : 'claude-sonnet-4-6',
+      max_tokens: 1000,
+      system: system,
+      messages: trimmed
+    });
+    const opts = {
+      hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': CONFIG.ANTHROPIC_KEY,
+        'anthropic-version': '2023-06-01',
+        'Content-Length': Buffer.byteLength(bodyStr)
+      }
+    };
+
+    const reply = await new Promise((resolve, reject) => {
+      const req = https.request(opts, res => {
+        let d = ''; res.on('data', c => d += c);
+        res.on('end', () => {
+          try {
+            const p = JSON.parse(d);
+            if (p.error) return reject(new Error(p.error.message));
+            resolve(p.content.filter(b => b.type === 'text').map(b => b.text).join(''));
+          } catch(e) { reject(e); }
+        });
+      });
+      req.on('error', reject);
+      req.write(bodyStr); req.end();
+    });
+
+    session.messages.push({ role: 'assistant', content: reply });
+    // Cap session memory at 20 messages
+    if (session.messages.length > 20) session.messages = session.messages.slice(-20);
+
+    // Send reply with agent prefix
+    const prefix = agentId === 'raven' ? '🪶' : agentId === 'nova' ? '✨' : agentId === 'atlas' ? '🗺️' : agentId === 'gen' ? '🌀' : '✕';
+    await tgSend(chatId, `${prefix} *${agentId.toUpperCase()}*\n\n${reply}`);
+
+  } catch(e) {
+    console.error('[TG] Error:', e.message);
+    await tgSend(chatId, '🪶 hit an error. try again?');
+  }
+}
+
+// Poll Telegram for updates every 3 seconds
+async function tgPoll() {
+  if (!CONFIG.TELEGRAM_TOKEN) return;
+  try {
+    const res = await tgRequest('getUpdates', { offset: tgOffset, timeout: 2, limit: 10 });
+    if (!res.ok || !res.result || !res.result.length) return;
+
+    for (const update of res.result) {
+      tgOffset = update.update_id + 1;
+      if (update.message && update.message.text) {
+        handleTgMessage(update.message).catch(e => console.error('[TG] Handler error:', e.message));
+      }
+    }
+  } catch(e) {
+    // Silent fail — network blip
+  }
+}
+
+// Telegram broadcast — send message to all users with telegram_chat_id
+async function tgBroadcast(message, userIds) {
+  if (!CONFIG.TELEGRAM_TOKEN) return;
+  // TODO: when users link their Telegram chat ID to their account
+  console.log('[TG BROADCAST] Would send to', userIds ? userIds.length : 'all', 'users');
+}
+
+// Start polling if token is set
+if (CONFIG.TELEGRAM_TOKEN) {
+  setInterval(tgPoll, 3000);
+  console.log('[LUNARI] Telegram: ACTIVE');
+
+  // Set bot commands on startup
+  setTimeout(() => {
+    tgRequest('setMyCommands', { commands: [
+      { command: 'start', description: 'Meet your LUNARI crew' },
+      { command: 'help', description: 'How to use LUNARI' },
+      { command: 'clear', description: 'Clear conversation memory' },
+      { command: 'status', description: 'Your account status' },
+      { command: 'web', description: 'Open lunari.pro' },
+    ]}).then(() => console.log('[TG] Commands set'));
+  }, 2000);
+}
