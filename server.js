@@ -589,8 +589,15 @@ function postLunariTweet(text) {
 }
 
 async function runAutonomousTwitter() {
-  if (!TWITTER.LUNARI_TOKEN || !CONFIG.ANTHROPIC_KEY) return;
   console.log('[TWITTER AUTO] Running daily post...');
+  console.log('[TWITTER AUTO] API_KEY:', TWITTER.API_KEY ? 'SET' : 'MISSING');
+  console.log('[TWITTER AUTO] LUNARI_TOKEN:', TWITTER.LUNARI_TOKEN ? 'SET' : 'MISSING');
+  console.log('[TWITTER AUTO] LUNARI_SECRET:', TWITTER.LUNARI_SECRET ? 'SET' : 'MISSING');
+  console.log('[TWITTER AUTO] SERPER:', process.env.SERPER_API_KEY ? 'SET' : 'MISSING');
+  if (!TWITTER.LUNARI_TOKEN || !CONFIG.ANTHROPIC_KEY) {
+    console.log('[TWITTER AUTO] Aborting — missing credentials');
+    return;
+  }
   try {
     const topics = ['AI tools for creators 2026', 'autonomous AI agents', 'solo founder productivity AI', 'AI marketing automation'];
     const query = topics[new Date().getDay() % topics.length];
