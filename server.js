@@ -396,6 +396,122 @@ async function executeBuild(task,userId,siteName,jobId) {
   }catch(err){BUILD_RESULTS[jobId]={status:'error',error:err.message};throw err;}
 }
 
+// ── SITE ITERATION — edit existing sites ─────────
+function fetchSiteHtml(siteUrl) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(siteUrl);
+    const opts = { hostname: url.hostname, path: url.pathname || '/', method: 'GET',
+      headers: { 'User-Agent': 'LUNARI/1.0', 'Accept': 'text/html' }
+    };
+    const req = https.request(opts, res => {
+      if (res.statusCode === 301 || res.statusCode === 302) {
+        // Follow redirect
+        return fetchSiteHtml(res.headers.location).then(resolve).catch(reject);
+      }
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => {
+        if (res.statusCode !== 200) return reject(new Error('Fetch failed: ' + res.statusCode));
+        if (!d.includes('<html') && !d.includes('<!DOCTYPE')) return reject(new Error('Not valid HTML'));
+        resolve(d);
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+function iterateWithClaude(currentHtml, instructions, siteName) {
+  return new Promise((resolve, reject) => {
+    const system = 'You are a web developer editing an existing website. Rules: (1) Output the COMPLETE updated HTML file starting with <!DOCTYPE html>. (2) No markdown, no code fences, no explanation. (3) Preserve ALL existing content, styles, and structure UNLESS the user specifically asks to change something. (4) Make ONLY the changes the user requested. (5) Keep all existing colors, fonts, layouts intact unless told otherwise. (6) The output must be a complete, working HTML file.';
+    const user = 'Here is the current HTML of the site "' + (siteName || 'user site') + '":\n\n' + currentHtml.slice(0, 80000) + '\n\n---\n\nThe user wants these changes:\n' + instructions + '\n\nOutput the COMPLETE updated HTML file. Start with <!DOCTYPE html> immediately. Change ONLY what was requested. Preserve everything else exactly.';
+    const rb = JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 16000, system, messages: [{ role: 'user', content: user }] });
+    const opts = { hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': CONFIG.ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'Content-Length': Buffer.byteLength(rb) }
+    };
+    const req = https.request(opts, res => { let d = ''; res.on('data', c => d += c); res.on('end', () => {
+      try {
+        const p = JSON.parse(d);
+        if (p.error) return reject(new Error(p.error.message));
+        const t = p.content.filter(b => b.type === 'text').map(b => b.text).join('');
+        const clean = t.replace(/^```html\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/i, '').trim();
+        if (!clean.includes('<!DOCTYPE') && !clean.includes('<html')) return reject(new Error('Claude did not return valid HTML'));
+        resolve(clean);
+      } catch(e) { reject(e); }
+    }); });
+    req.on('error', reject); req.write(rb); req.end();
+  });
+}
+
+function redeployToNetlify(netlifyId, html) {
+  return new Promise((resolve, reject) => {
+    const hb = Buffer.from(html, 'utf8');
+    const sha1 = crypto.createHash('sha1').update(hb).digest('hex');
+    const db = JSON.stringify({ files: { '/index.html': sha1 }, draft: false });
+    const dopt = {
+      hostname: 'api.netlify.com', path: '/api/v1/sites/' + netlifyId + '/deploys', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + CONFIG.NETLIFY_TOKEN, 'Content-Length': Buffer.byteLength(db) }
+    };
+    const dr = https.request(dopt, dres => {
+      let dd = ''; dres.on('data', c => dd += c);
+      dres.on('end', () => {
+        try {
+          const deploy = JSON.parse(dd);
+          if (!deploy.id) return reject(new Error('Deploy failed: ' + dd.slice(0, 200)));
+          console.log('[ITERATE] Deploy: ' + deploy.id);
+          const uo = {
+            hostname: 'api.netlify.com', path: '/api/v1/deploys/' + deploy.id + '/files/index.html', method: 'PUT',
+            headers: { 'Content-Type': 'text/html; charset=utf-8', 'Authorization': 'Bearer ' + CONFIG.NETLIFY_TOKEN, 'Content-Length': hb.length }
+          };
+          const ur = https.request(uo, ures => {
+            let ud = ''; ures.on('data', c => ud += c);
+            ures.on('end', () => {
+              console.log('[ITERATE] Upload: ' + ures.statusCode);
+              waitForDeploy(deploy.id).then(() => resolve()).catch(() => resolve());
+            });
+          });
+          ur.on('error', reject); ur.write(hb); ur.end();
+        } catch(e) { reject(e); }
+      });
+    });
+    dr.on('error', reject); dr.write(db); dr.end();
+  });
+}
+
+async function executeIterate(netlifyId, siteUrl, instructions, siteName, userId, jobId) {
+  BUILD_RESULTS[jobId] = { status: 'building', message: 'Fetching your current site...' };
+  try {
+    console.log('[ITERATE] Starting for', siteUrl, '— instructions:', instructions.slice(0, 80));
+
+    BUILD_RESULTS[jobId].message = 'Reading your current site...';
+    const currentHtml = await fetchSiteHtml(siteUrl);
+    console.log('[ITERATE] Fetched', currentHtml.length, 'bytes from', siteUrl);
+
+    BUILD_RESULTS[jobId].message = 'Applying your changes with Claude...';
+    const updatedHtml = await iterateWithClaude(currentHtml, instructions, siteName);
+    if (!updatedHtml || updatedHtml.length < 500) throw new Error('Updated HTML too short: ' + updatedHtml.length + ' bytes');
+    console.log('[ITERATE] Generated', updatedHtml.length, 'bytes of updated HTML');
+
+    BUILD_RESULTS[jobId].message = 'Redeploying to ' + siteUrl + '...';
+    await redeployToNetlify(netlifyId, updatedHtml);
+
+    BUILD_RESULTS[jobId] = { status: 'done', url: siteUrl, siteId: netlifyId, message: 'Updated at ' + siteUrl, userId, builtAt: new Date().toISOString(), iterated: true };
+    slackNotify('✏️', 'Site Updated', siteUrl + ' — ' + instructions.slice(0, 80));
+
+    // Update site_builds record
+    await sbFetch('PATCH', `site_builds?netlify_id=eq.${netlifyId}`, {
+      task: instructions.slice(0, 200),
+      built_at: new Date().toISOString()
+    }).catch(() => {});
+
+    console.log('[ITERATE] ✓ Done —', siteUrl);
+    return BUILD_RESULTS[jobId];
+  } catch(err) {
+    console.error('[ITERATE] Error:', err.message);
+    BUILD_RESULTS[jobId] = { status: 'error', error: err.message };
+    throw err;
+  }
+}
+
 // ── Claude API ───────────────────────────────────
 const AGENT_SYSTEMS={
   raven:'You are RAVEN. You lead the LUNARI crew. Think fast, speak like a founder who has already solved the problem. Direct, casual, no padding. You can do anything: plan, build, write, strategize. You know when to pull in the crew.',
@@ -1165,6 +1281,35 @@ function handleRequest(req,res){
   if(req.method==='GET'&&url.startsWith('/execute/status/')){
     const jobId=url.split('/').pop();
     res.writeHead(200);return res.end(JSON.stringify(BUILD_RESULTS[jobId]||{status:'building',message:'Still working...'}));
+  }
+
+  // ── SITE ITERATION ──────────────────────────────
+  if(req.method==='POST'&&url==='/execute/iterate'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try{
+        const{netlifyId,siteUrl,instructions,siteName,userId}=JSON.parse(b);
+        if(!instructions){res.writeHead(400);return res.end(JSON.stringify({error:'Missing instructions'}));}
+        if(!netlifyId||!siteUrl){res.writeHead(400);return res.end(JSON.stringify({error:'Missing site info — which site to update?'}));}
+        if(!CONFIG.ANTHROPIC_KEY){res.writeHead(500);return res.end(JSON.stringify({error:'No API key'}));}
+        if(!CONFIG.NETLIFY_TOKEN){res.writeHead(500);return res.end(JSON.stringify({error:'No Netlify token'}));}
+        const jobId=Date.now().toString();
+        res.writeHead(200);res.end(JSON.stringify({ok:true,jobId,message:'Updating your site...'}));
+        executeIterate(netlifyId,siteUrl,instructions,siteName,userId,jobId).catch(e=>console.error('[ITERATE]',e.message));
+      }catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}
+    });return;
+  }
+
+  // User's sites list
+  if(req.method==='GET'&&url.startsWith('/user/sites')){
+    const params=new URL('http://x'+req.url).searchParams;
+    const userId=params.get('userId');
+    if(!userId){res.writeHead(400);return res.end(JSON.stringify({error:'Missing userId'}));}
+    sbAdmin('GET',`site_builds?user_id=eq.${userId}&select=url,netlify_id,site_name,task,built_at&order=built_at.desc&limit=20`).then(function(rows){
+      res.writeHead(200);res.end(JSON.stringify({sites:rows||[]}));
+    }).catch(function(){
+      res.writeHead(200);res.end(JSON.stringify({sites:[]}));
+    });
+    return;
   }
 
   if(req.method==='GET'&&url==='/schedules'){res.writeHead(200);return res.end(JSON.stringify({schedules:SCHEDULES}));}
