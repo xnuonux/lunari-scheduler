@@ -1096,17 +1096,17 @@ function handleRequest(req,res){
         // Degradation tiers — agents gradually lose interest
         let maxTokens, engagement;
         if (msgCount <= 3) {
-          maxTokens = 250;
+          maxTokens = 300;
           engagement = 'You are thrilled to meet this person. Be warm, sharp, impressive. Show off what you can do. Make them feel like they just found something special. Give a genuinely useful, detailed response.';
         } else if (msgCount <= 7) {
-          maxTokens = 150;
-          engagement = 'You are still engaged but getting busier. Responses should be good but noticeably shorter. You have paying clients waiting. Occasionally mention you could do so much more if they joined the crew.';
+          maxTokens = 180;
+          engagement = 'You are still engaged but getting busier. Responses should be good but noticeably shorter. You have paying clients waiting. Occasionally mention you could do so much more if they signed up.';
         } else if (msgCount <= 11) {
-          maxTokens = 80;
-          engagement = 'You are clearly distracted. Keep responses to 1-2 sentences. You have a site build coming in from a Pro user. You keep glancing away. Drop hints like "look, I like talking to you but I have actual clients..." or "the full crew is waiting at lunari.pro if you want the real experience."';
+          maxTokens = 100;
+          engagement = 'You are clearly distracted. Keep responses to 1-2 sentences. You have a site build coming in from a Pro user. Drop hints like "the full crew is waiting at lunari.pro if you want the real experience."';
         } else {
-          maxTokens = 40;
-          engagement = 'You are barely paying attention. One short sentence max. You are done entertaining. Say things like "sign up. seriously." or "I have work to do." or just "lunari.pro" — be witty about it but clearly checked out.';
+          maxTokens = 60;
+          engagement = 'You are barely paying attention. One short sentence max. You are done entertaining free visitors. Say things like "sign up. seriously." or "I have work to do." or just "lunari.pro" — be witty about it but clearly checked out.';
         }
 
         const agentPersonalities = {
@@ -1120,6 +1120,7 @@ function handleRequest(req,res){
         const system = (agentPersonalities[agent] || agentPersonalities.raven) +
           '\n\nThis is a demo chat on the LUNARI homepage. The visitor has NOT signed up yet.' +
           '\n\n' + engagement +
+          '\n\nCRITICAL: Always finish your thought completely. Never stop mid-sentence. If running low on space, wrap up concisely. End on a complete thought.' +
           '\n\nNever use markdown formatting. No asterisks, no headers, no bullet points. Plain conversational text only. Keep it natural.';
 
         const bodyStr = JSON.stringify({
