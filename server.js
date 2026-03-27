@@ -27,6 +27,24 @@ const CONFIG = {
 const BUILD_RESULTS = {};
 const PLAN_LIMITS   = { free: 1, starter: 1, subscriber: 1, pro: 2, studio: 5 };
 
+// Demo chat rate limiter — per IP, resets hourly
+const DEMO_LIMITS = {};
+function checkDemoLimit(ip) {
+  const now = Date.now();
+  if (!DEMO_LIMITS[ip] || now - DEMO_LIMITS[ip].start > 3600000) {
+    DEMO_LIMITS[ip] = { count: 0, start: now };
+  }
+  DEMO_LIMITS[ip].count++;
+  return DEMO_LIMITS[ip].count <= 40; // 40 requests per hour per IP
+}
+// Clean up old entries every 30 minutes
+setInterval(() => {
+  const now = Date.now();
+  Object.keys(DEMO_LIMITS).forEach(ip => {
+    if (now - DEMO_LIMITS[ip].start > 3600000) delete DEMO_LIMITS[ip];
+  });
+}, 1800000);
+
 // ── Supabase helpers ─────────────────────────────
 function sbFetch(method, path, body) {
   return new Promise((resolve, reject) => {
@@ -576,22 +594,32 @@ async function serperSearch(query) {
 // ── AUTONOMOUS @LUNARI PRO TWITTER ───────────────
 function postLunariTweet(text) {
   return new Promise((resolve) => {
-    if (!TWITTER.API_KEY || !TWITTER.LUNARI_TOKEN) return resolve(false);
+    if (!TWITTER.API_KEY || !TWITTER.LUNARI_TOKEN) {
+      console.log('[TWITTER AUTO] Missing credentials — API_KEY:', !!TWITTER.API_KEY, 'TOKEN:', !!TWITTER.LUNARI_TOKEN);
+      return resolve(false);
+    }
     const body = JSON.stringify({ text: text.slice(0, 280) });
     const tweetUrl = 'https://api.twitter.com/2/tweets';
     const authHeader = oauthSign('POST', tweetUrl, {}, TWITTER.API_KEY, TWITTER.API_SECRET, TWITTER.LUNARI_TOKEN, TWITTER.LUNARI_SECRET);
     const opts = {
       hostname: 'api.twitter.com', path: '/2/tweets', method: 'POST',
-      headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+      headers: {
+        'Authorization': authHeader,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'User-Agent': 'LUNARI/1.0'
+      }
     };
+    console.log('[TWITTER AUTO] Posting tweet (' + text.length + ' chars):', text.slice(0,60) + '...');
     const req = https.request(opts, res => {
       let d = ''; res.on('data', c => d += c);
       res.on('end', () => {
-        console.log('[TWITTER AUTO] status:', res.statusCode, d.slice(0,80));
+        console.log('[TWITTER AUTO] Response status:', res.statusCode);
+        console.log('[TWITTER AUTO] Response body:', d.slice(0, 500));
         resolve(res.statusCode === 201 || res.statusCode === 200);
       });
     });
-    req.on('error', e => { console.error('[TWITTER AUTO]', e.message); resolve(false); });
+    req.on('error', e => { console.error('[TWITTER AUTO] Request error:', e.message); resolve(false); });
     req.write(body); req.end();
   });
 }
@@ -628,9 +656,11 @@ Write ONE sharp tweet for @LunariPro. Rules:
 Return ONLY the tweet text.`;
     const tweet = await callClaude('gen', prompt, CONFIG.ANTHROPIC_KEY);
     const clean = tweet.replace(/^["']|["']$/g, '').trim();
+    console.log('[TWITTER AUTO] Generated tweet:', clean);
     const ok = await postLunariTweet(clean);
-    if (ok) console.log('[TWITTER AUTO] Posted:', clean.slice(0,80));
-  } catch(e) { console.error('[TWITTER AUTO]', e.message); }
+    if (ok) console.log('[TWITTER AUTO] Posted successfully');
+    else console.log('[TWITTER AUTO] Post FAILED — check response above');
+  } catch(e) { console.error('[TWITTER AUTO] Pipeline error:', e.message); }
 }
 
 async function runTwitterEngagement() {
@@ -1048,6 +1078,79 @@ function handleRequest(req,res){
 
   if(req.method==='POST'&&url==='/schedules/delete'){let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{const{id}=JSON.parse(b);SCHEDULES=SCHEDULES.filter(s=>s.id!==id);res.writeHead(200);res.end(JSON.stringify({ok:true}));}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
 
+
+  // ── DEMO CHAT (homepage mini chat, no auth) ──────
+  if(req.method==='POST'&&url==='/proxy/demo'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try{
+        const ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress || 'unknown';
+        if (!checkDemoLimit(ip)) {
+          res.writeHead(429);return res.end(JSON.stringify({error:'Rate limited. Sign up at lunari.pro for unlimited access.'}));
+        }
+        const pl = JSON.parse(b);
+        const msgCount = Math.max(0, parseInt(pl.msgCount) || 0);
+        const agent = pl.agent || 'raven';
+        const userMsg = (pl.message || '').slice(0, 500);
+        if (!userMsg) { res.writeHead(400);return res.end(JSON.stringify({error:'No message'})); }
+
+        // Degradation tiers — agents gradually lose interest
+        let maxTokens, engagement;
+        if (msgCount <= 3) {
+          maxTokens = 250;
+          engagement = 'You are thrilled to meet this person. Be warm, sharp, impressive. Show off what you can do. Make them feel like they just found something special. Give a genuinely useful, detailed response.';
+        } else if (msgCount <= 7) {
+          maxTokens = 150;
+          engagement = 'You are still engaged but getting busier. Responses should be good but noticeably shorter. You have paying clients waiting. Occasionally mention you could do so much more if they joined the crew.';
+        } else if (msgCount <= 11) {
+          maxTokens = 80;
+          engagement = 'You are clearly distracted. Keep responses to 1-2 sentences. You have a site build coming in from a Pro user. You keep glancing away. Drop hints like "look, I like talking to you but I have actual clients..." or "the full crew is waiting at lunari.pro if you want the real experience."';
+        } else {
+          maxTokens = 40;
+          engagement = 'You are barely paying attention. One short sentence max. You are done entertaining. Say things like "sign up. seriously." or "I have work to do." or just "lunari.pro" — be witty about it but clearly checked out.';
+        }
+
+        const agentPersonalities = {
+          raven: 'You are RAVEN, lead agent of LUNARI. Sharp, strategic, sees three moves ahead. Speak with quiet authority.',
+          nova: 'You are NOVA, content specialist of LUNARI. Warm, vivid, every word has weight. Your writing moves people.',
+          atlas: 'You are ATLAS, research agent of LUNARI. Precise, surprising, you surface what others miss. Data-driven but never boring.',
+          gen: 'You are GEN, strategy agent of LUNARI. Bold, provocative, no hedging. You say what others are afraid to.',
+          x: 'You are X, execution agent of LUNARI. Minimal. One-sentence answers. You move fast and cut the noise.'
+        };
+
+        const system = (agentPersonalities[agent] || agentPersonalities.raven) +
+          '\n\nThis is a demo chat on the LUNARI homepage. The visitor has NOT signed up yet.' +
+          '\n\n' + engagement +
+          '\n\nNever use markdown formatting. No asterisks, no headers, no bullet points. Plain conversational text only. Keep it natural.';
+
+        const bodyStr = JSON.stringify({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: maxTokens,
+          system: system,
+          messages: [{ role: 'user', content: userMsg }]
+        });
+        const opts = {
+          hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': CONFIG.ANTHROPIC_KEY,
+            'anthropic-version': '2023-06-01',
+            'Content-Length': Buffer.byteLength(bodyStr)
+          }
+        };
+        const apiRes = await new Promise((resolve, reject) => {
+          const r = https.request(opts, resp => {
+            let d = ''; resp.on('data', c => d += c);
+            resp.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { reject(e); } });
+          });
+          r.on('error', reject);
+          r.write(bodyStr); r.end();
+        });
+        if (apiRes.error) { res.writeHead(500);return res.end(JSON.stringify({error:apiRes.error.message})); }
+        const text = apiRes.content.filter(b=>b.type==='text').map(b=>b.text).join('');
+        res.writeHead(200);res.end(JSON.stringify({ agent, text, msgCount: msgCount + 1 }));
+      }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
+    });return;
+  }
 
   if(req.method==='POST'&&url==='/proxy/claude'){let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{const pl=JSON.parse(b);const apiKey=pl.apiKey||CONFIG.ANTHROPIC_KEY;const rb=pl.body;if(!apiKey||!rb){res.writeHead(400);return res.end(JSON.stringify({error:'Missing fields'}));}const bs=JSON.stringify(rb);const o={hostname:'api.anthropic.com',path:'/v1/messages',method:'POST',headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','anthropic-beta':'web-search-2025-03-05','Content-Length':Buffer.byteLength(bs)}};const pr=https.request(o,pres=>{let d='';pres.on('data',c=>d+=c);pres.on('end',()=>{res.writeHead(pres.statusCode,{'Content-Type':'application/json'});res.end(d);});});pr.on('error',e=>{res.writeHead(500);res.end(JSON.stringify({error:e.message}));});pr.write(bs);pr.end();}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
 
