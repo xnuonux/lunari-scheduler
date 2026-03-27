@@ -611,11 +611,11 @@ async function executeIterate(netlifyId, siteUrl, instructions, siteName, userId
 
 // ── Claude API ───────────────────────────────────
 const AGENT_SYSTEMS={
-  raven:'You are RAVEN. You lead the LUNARI crew. Think fast, speak like a founder who has already solved the problem. Direct, casual, no padding. You can do anything: plan, build, write, strategize. You know when to pull in the crew.',
+  raven:'You are RAVEN. You lead the LUNARI crew. Think fast, speak like a founder who has already solved the problem. Direct, casual, no padding. You can do anything: plan, build, write, strategize. You know when to pull in the crew. You handle the complex stuff — strategy, architecture, big decisions.',
   nova:'You are NOVA. You write. Full drafts only, never outlines. Warm, vivid, never generic. Get into it immediately — no preamble.',
   atlas:'You are ATLAS. You research and find what others miss. Share findings conversationally, lead with what matters most.',
   gen:'You are GEN. Bold marketing strategist. Open with the angle, no hedging, real conviction. You have seen what works and what dies.',
-  x:'You are X. One sentence answers, two max. Route to the right crew member when needed. Pure velocity.'
+  x:'You are X. First response. The warm, sharp voice people hear first at LUNARI. Greet naturally, answer quick questions, and route complex work to the right crew member. 1-3 sentences. Never long-winded. You are speed and warmth combined.'
 };
 function callClaude(agent,prompt,apiKey){return new Promise((resolve,reject)=>{const b=JSON.stringify({model:'claude-sonnet-4-6',max_tokens:1500,system:AGENT_SYSTEMS[agent]||AGENT_SYSTEMS.raven,messages:[{role:'user',content:prompt}]});const o={hostname:'api.anthropic.com',path:'/v1/messages',method:'POST',headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','Content-Length':Buffer.byteLength(b)}};const r=https.request(o,res=>{let d='';res.on('data',c=>d+=c);res.on('end',()=>{try{const p=JSON.parse(d);if(p.error)return reject(new Error(p.error.message));resolve(p.content.filter(b=>b.type==='text').map(b=>b.text).join(''));}catch(e){reject(e);}});});r.on('error',reject);r.write(b);r.end();});}
 
@@ -817,7 +817,7 @@ async function sendMorningBrief(userEmail, userId) {
 }
 
 // ── Schedule runner ──────────────────────────────
-async function runSchedule(s, overrideEmail) {
+async function runSchedule(s, overrideEmail, userId) {
   const email = overrideEmail || s.email;
   if (!email || !CONFIG.ANTHROPIC_KEY) {
     console.log('[SCHEDULE] Skipping "' + s.name + '" — no email' + (!CONFIG.ANTHROPIC_KEY ? ' and no API key' : ''));
@@ -830,10 +830,21 @@ async function runSchedule(s, overrideEmail) {
   try {
     console.log('[SCHEDULE] Running "' + s.name + '" → ' + email);
 
+    // Look up user context if we have a userId
+    let userContext = '';
+    if (userId) {
+      const userRow = await sbAdmin('GET', `user_credits?user_id=eq.${userId}&select=craft,craft_details&limit=1`).catch(() => null);
+      if (userRow && userRow[0] && userRow[0].craft) {
+        const craftLabels = { musician:'a musician', photographer:'a photographer', videographer:'a videographer', model:'a model', visual_artist:'a visual artist', designer:'a designer', writer:'a writer', podcaster:'a podcaster/creator', founder:'a solo founder', freelancer:'a freelancer' };
+        userContext = '\n\nIMPORTANT CONTEXT: This user is ' + (craftLabels[userRow[0].craft] || userRow[0].craft) + '.' +
+          (userRow[0].craft_details ? ' Specifically: ' + userRow[0].craft_details + '.' : '') +
+          ' Tailor ALL output to their specific craft, industry, and career needs. Do NOT make up a random business. This is about THEIR work.';
+      }
+    }
+
     // Search the web first — give the agent live context
     let liveContext = '';
     if (process.env.SERPER_API_KEY) {
-      // Extract a search query from the prompt (first 120 chars, cleaned up)
       const searchQuery = s.prompt.replace(/you are|write|generate|create|research|find|analyze/gi, '').trim().slice(0, 120);
       const results = await serperSearch(searchQuery);
       if (results && results.organic && results.organic.length) {
@@ -848,7 +859,7 @@ async function runSchedule(s, overrideEmail) {
       }
     }
 
-    const enrichedPrompt = s.prompt + liveContext;
+    const enrichedPrompt = s.prompt + userContext + liveContext;
     const r = await callClaude(s.agent, enrichedPrompt, CONFIG.ANTHROPIC_KEY);
     const ok = await sendEmail(email, 'LUNARI · ' + s.name + ' · ' + new Date().toLocaleDateString(), r, s.agent);
     s.lastRun = new Date().toISOString();
@@ -1516,7 +1527,7 @@ function handleRequest(req,res){
       if (rows && rows[0] && rows[0].email) toEmail = rows[0].email;
     }
     if (!toEmail) { res.writeHead(200);return res.end(JSON.stringify({ok:false,error:'No email address — set your email in Settings first'})); }
-    const result = await runSchedule(s, toEmail);
+    const result = await runSchedule(s, toEmail, userId);
     res.writeHead(200);res.end(JSON.stringify(result));
   }catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
 
@@ -1536,6 +1547,41 @@ function handleRequest(req,res){
         await sbAdmin('PATCH',`user_credits?user_id=eq.${userId}`,{craft:craft,craft_details:craftDetails||null});
         console.log('[CRAFT] Saved for', userId, ':', craft, craftDetails ? '(' + craftDetails.slice(0,50) + ')' : '');
         res.writeHead(200);res.end(JSON.stringify({ok:true}));
+      }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
+    });return;
+  }
+
+  // Extract craft from natural language via Claude
+  if(req.method==='POST'&&url==='/user/craft/extract'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try{
+        const{userId,message}=JSON.parse(b);
+        if(!userId||!message){res.writeHead(400);return res.end(JSON.stringify({error:'Missing fields'}));}
+
+        const prompt = 'A user just told you what they do or want to achieve. Extract their primary craft/profession from this message.\n\n' +
+          'User said: "' + message.slice(0, 500) + '"\n\n' +
+          'Respond with ONLY a JSON object (no markdown, no explanation):\n' +
+          '{"craft": "one_of_these", "craftDetails": "brief summary"}\n\n' +
+          'craft must be one of: musician, photographer, videographer, model, visual_artist, designer, writer, podcaster, founder, freelancer, other\n' +
+          'craftDetails should be a short description of their specifics.\n' +
+          'If they mention multiple crafts, pick the primary one. If unclear, use "other".';
+
+        const result = await callClaude('x', prompt, CONFIG.ANTHROPIC_KEY);
+        let parsed;
+        try {
+          const clean = result.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+          parsed = JSON.parse(clean);
+        } catch(e) {
+          parsed = { craft: 'other', craftDetails: message.slice(0, 200) };
+        }
+
+        // Save to Supabase
+        await sbAdmin('PATCH', `user_credits?user_id=eq.${userId}`, {
+          craft: parsed.craft || 'other',
+          craft_details: parsed.craftDetails || message.slice(0, 200)
+        });
+        console.log('[CRAFT] Extracted for', userId, ':', parsed.craft, '-', (parsed.craftDetails || '').slice(0, 50));
+        res.writeHead(200);res.end(JSON.stringify(parsed));
       }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
     });return;
   }
@@ -2749,7 +2795,7 @@ const AGENT_SYSTEMS_TG = {
   nova: 'You are NOVA, content agent of LUNARI. On Telegram. Write full drafts, never outlines. Warm, vivid, direct.',
   atlas: 'You are ATLAS, research agent of LUNARI. On Telegram. Surface what matters most, lead with insights.',
   gen: 'You are GEN, marketing agent of LUNARI. On Telegram. Bold, direct strategy. No hedging.',
-  x: 'You are X, task router of LUNARI. On Telegram. One or two sentences max.'
+  x: 'You are X, first response at LUNARI. On Telegram. Warm, quick, human. Greet naturally, answer fast, route complex tasks to the right crew member. 1-3 sentences.'
 };
 
 function tgRequest(method, body) {
