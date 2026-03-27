@@ -576,32 +576,22 @@ async function serperSearch(query) {
 // ── AUTONOMOUS @LUNARI PRO TWITTER ───────────────
 function postLunariTweet(text) {
   return new Promise((resolve) => {
-    if (!TWITTER.API_KEY || !TWITTER.LUNARI_TOKEN) {
-      console.log('[TWITTER AUTO] Missing credentials — API_KEY:', !!TWITTER.API_KEY, 'TOKEN:', !!TWITTER.LUNARI_TOKEN);
-      return resolve(false);
-    }
+    if (!TWITTER.API_KEY || !TWITTER.LUNARI_TOKEN) return resolve(false);
     const body = JSON.stringify({ text: text.slice(0, 280) });
     const tweetUrl = 'https://api.twitter.com/2/tweets';
     const authHeader = oauthSign('POST', tweetUrl, {}, TWITTER.API_KEY, TWITTER.API_SECRET, TWITTER.LUNARI_TOKEN, TWITTER.LUNARI_SECRET);
     const opts = {
       hostname: 'api.twitter.com', path: '/2/tweets', method: 'POST',
-      headers: {
-        'Authorization': authHeader,
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body),
-        'User-Agent': 'LUNARI/1.0'
-      }
+      headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
     };
-    console.log('[TWITTER AUTO] Posting tweet (' + text.length + ' chars):', text.slice(0,60) + '...');
     const req = https.request(opts, res => {
       let d = ''; res.on('data', c => d += c);
       res.on('end', () => {
-        console.log('[TWITTER AUTO] Response status:', res.statusCode);
-        console.log('[TWITTER AUTO] Response body:', d.slice(0, 500));
+        console.log('[TWITTER AUTO] status:', res.statusCode, d.slice(0,80));
         resolve(res.statusCode === 201 || res.statusCode === 200);
       });
     });
-    req.on('error', e => { console.error('[TWITTER AUTO] Request error:', e.message); resolve(false); });
+    req.on('error', e => { console.error('[TWITTER AUTO]', e.message); resolve(false); });
     req.write(body); req.end();
   });
 }
@@ -638,11 +628,9 @@ Write ONE sharp tweet for @LunariPro. Rules:
 Return ONLY the tweet text.`;
     const tweet = await callClaude('gen', prompt, CONFIG.ANTHROPIC_KEY);
     const clean = tweet.replace(/^["']|["']$/g, '').trim();
-    console.log('[TWITTER AUTO] Generated tweet:', clean);
     const ok = await postLunariTweet(clean);
-    if (ok) console.log('[TWITTER AUTO] ✓ Posted successfully');
-    else console.log('[TWITTER AUTO] ✗ Post FAILED — check response above');
-  } catch(e) { console.error('[TWITTER AUTO] Pipeline error:', e.message); }
+    if (ok) console.log('[TWITTER AUTO] Posted:', clean.slice(0,80));
+  } catch(e) { console.error('[TWITTER AUTO]', e.message); }
 }
 
 async function runTwitterEngagement() {
@@ -926,7 +914,6 @@ async function sendGmail(userId, to, subject, body) {
   return { ok: false, error: JSON.stringify(result.data).slice(0, 100) };
 }
 
-
 function handleRequest(req,res){
   res.setHeader('Access-Control-Allow-Origin','*');
   res.setHeader('Access-Control-Allow-Methods','GET, POST, OPTIONS');
@@ -980,109 +967,61 @@ function handleRequest(req,res){
     let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
       try{
         const results = {};
-
-        // TEST 1: Verify consumer key/secret via OAuth 2.0 bearer token
-        // If this fails → API_KEY or API_SECRET is wrong
+        // TEST 1: Consumer keys via OAuth 2.0 bearer
         results.step1_consumer_keys = await new Promise((resolve) => {
           const credentials = Buffer.from(TWITTER.API_KEY + ':' + TWITTER.API_SECRET).toString('base64');
           const body = 'grant_type=client_credentials';
-          const opts = {
-            hostname: 'api.twitter.com', path: '/oauth2/token', method: 'POST',
-            headers: {
-              'Authorization': 'Basic ' + credentials,
-              'Content-Type': 'application/x-www-form-urlencoded',
-              'Content-Length': Buffer.byteLength(body),
-              'User-Agent': 'LUNARI/1.0'
-            }
+          const opts = { hostname: 'api.twitter.com', path: '/oauth2/token', method: 'POST',
+            headers: { 'Authorization': 'Basic ' + credentials, 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body), 'User-Agent': 'LUNARI/1.0' }
           };
-          const req2 = https.request(opts, r => {
-            let d = ''; r.on('data', c => d += c);
-            r.on('end', () => {
-              let parsed; try { parsed = JSON.parse(d); } catch(e) { parsed = d; }
-              resolve({
-                status: r.statusCode,
-                ok: r.statusCode === 200,
-                verdict: r.statusCode === 200 ? 'CONSUMER KEYS VALID' : 'CONSUMER KEYS INVALID — check TWITTER_API_KEY and TWITTER_API_SECRET',
-                body: parsed
-              });
-            });
-          });
+          const req2 = https.request(opts, r => { let d = ''; r.on('data', c => d += c); r.on('end', () => {
+            let parsed; try { parsed = JSON.parse(d); } catch(e) { parsed = d; }
+            resolve({ status: r.statusCode, ok: r.statusCode === 200, verdict: r.statusCode === 200 ? 'CONSUMER KEYS VALID' : 'CONSUMER KEYS INVALID', body: parsed });
+          }); });
           req2.on('error', e => resolve({ status: 0, error: e.message }));
           req2.write(body); req2.end();
         });
-
-        // TEST 2: Try posting a tweet with OAuth 1.0a
-        const text = 'LUNARI systems check — ' + new Date().toISOString().slice(0,16) + ' 🌙';
+        // TEST 2: Post tweet
+        const text = 'LUNARI systems check \u2014 ' + new Date().toISOString().slice(0,16) + ' \uD83C\uDF19';
         const tweetBody = JSON.stringify({ text });
         const tweetUrl = 'https://api.twitter.com/2/tweets';
         const authHeader = oauthSign('POST', tweetUrl, {}, TWITTER.API_KEY, TWITTER.API_SECRET, TWITTER.LUNARI_TOKEN, TWITTER.LUNARI_SECRET);
-
         results.step2_tweet_post = await new Promise((resolve) => {
-          const opts = {
-            hostname: 'api.twitter.com', path: '/2/tweets', method: 'POST',
-            headers: {
-              'Authorization': authHeader,
-              'Content-Type': 'application/json',
-              'Content-Length': Buffer.byteLength(tweetBody),
-              'User-Agent': 'LUNARI/1.0'
-            }
+          const opts = { hostname: 'api.twitter.com', path: '/2/tweets', method: 'POST',
+            headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(tweetBody), 'User-Agent': 'LUNARI/1.0' }
           };
-          const req2 = https.request(opts, r => {
-            let d = ''; r.on('data', c => d += c);
-            r.on('end', () => {
-              let parsed; try { parsed = JSON.parse(d); } catch(e) { parsed = d; }
-              let verdict = 'UNKNOWN';
-              if (r.statusCode === 201) verdict = 'TWEET POSTED SUCCESSFULLY';
-              else if (r.statusCode === 401) verdict = 'AUTH FAILED — access token may be wrong or OAuth 1.0a not enabled on app';
-              else if (r.statusCode === 403) verdict = 'FORBIDDEN — app lacks write permission or is suspended';
-              else if (r.statusCode === 429) verdict = 'RATE LIMITED — too many tweets';
-              resolve({ status: r.statusCode, verdict, body: parsed });
-            });
-          });
+          const req2 = https.request(opts, r => { let d = ''; r.on('data', c => d += c); r.on('end', () => {
+            let parsed; try { parsed = JSON.parse(d); } catch(e) { parsed = d; }
+            let verdict = r.statusCode === 201 ? 'TWEET POSTED' : r.statusCode === 401 ? 'AUTH FAILED' : r.statusCode === 403 ? 'FORBIDDEN' : r.statusCode === 429 ? 'RATE LIMITED' : r.statusCode === 402 ? 'CREDITS DEPLETED' : 'UNKNOWN';
+            resolve({ status: r.statusCode, verdict, body: parsed });
+          }); });
           req2.on('error', e => resolve({ status: 0, error: e.message }));
           req2.write(tweetBody); req2.end();
         });
-
-        // TEST 3: Verify access token via /2/users/me using OAuth 1.0a
+        // TEST 3: Verify access token via /2/users/me
         const meUrl = 'https://api.twitter.com/2/users/me';
         const meAuth = oauthSign('GET', meUrl, {}, TWITTER.API_KEY, TWITTER.API_SECRET, TWITTER.LUNARI_TOKEN, TWITTER.LUNARI_SECRET);
-
         results.step3_verify_token = await new Promise((resolve) => {
-          const opts = {
-            hostname: 'api.twitter.com', path: '/2/users/me', method: 'GET',
-            headers: {
-              'Authorization': meAuth,
-              'User-Agent': 'LUNARI/1.0'
-            }
+          const opts = { hostname: 'api.twitter.com', path: '/2/users/me', method: 'GET',
+            headers: { 'Authorization': meAuth, 'User-Agent': 'LUNARI/1.0' }
           };
-          const req2 = https.request(opts, r => {
-            let d = ''; r.on('data', c => d += c);
-            r.on('end', () => {
-              let parsed; try { parsed = JSON.parse(d); } catch(e) { parsed = d; }
-              let verdict = 'UNKNOWN';
-              if (r.statusCode === 200) verdict = 'ACCESS TOKEN VALID — OAuth 1.0a signing works, user: ' + (parsed.data ? parsed.data.username : '?');
-              else if (r.statusCode === 401) verdict = 'ACCESS TOKEN INVALID — LUNARI_TWITTER_TOKEN or LUNARI_TWITTER_SECRET is wrong';
-              else if (r.statusCode === 403) verdict = 'TOKEN VALID but endpoint forbidden — check API tier';
-              resolve({ status: r.statusCode, verdict, body: parsed });
-            });
-          });
+          const req2 = https.request(opts, r => { let d = ''; r.on('data', c => d += c); r.on('end', () => {
+            let parsed; try { parsed = JSON.parse(d); } catch(e) { parsed = d; }
+            let verdict = r.statusCode === 200 ? 'ACCESS TOKEN VALID — user: ' + (parsed.data ? parsed.data.username : '?') : r.statusCode === 401 ? 'ACCESS TOKEN INVALID' : 'UNKNOWN';
+            resolve({ status: r.statusCode, verdict, body: parsed });
+          }); });
           req2.on('error', e => resolve({ status: 0, error: e.message }));
           req2.end();
         });
-
-        // Summary
         const credentials = {
           API_KEY: TWITTER.API_KEY ? TWITTER.API_KEY.slice(0,8) + '... (' + TWITTER.API_KEY.length + ' chars)' : 'MISSING',
-          API_SECRET: TWITTER.API_SECRET ? TWITTER.API_SECRET.slice(0,4) + '... (' + TWITTER.API_SECRET.length + ' chars)' : 'MISSING',
+          API_SECRET: TWITTER.API_SECRET ? 'SET (' + TWITTER.API_SECRET.length + ' chars)' : 'MISSING',
           LUNARI_TOKEN: TWITTER.LUNARI_TOKEN ? TWITTER.LUNARI_TOKEN.slice(0,8) + '... (' + TWITTER.LUNARI_TOKEN.length + ' chars)' : 'MISSING',
-          LUNARI_SECRET: TWITTER.LUNARI_SECRET ? TWITTER.LUNARI_SECRET.slice(0,4) + '... (' + TWITTER.LUNARI_SECRET.length + ' chars)' : 'MISSING',
-          CLIENT_ID: TWITTER.CLIENT_ID ? TWITTER.CLIENT_ID.slice(0,6) + '... (' + TWITTER.CLIENT_ID.length + ' chars)' : 'NOT SET',
+          LUNARI_SECRET: TWITTER.LUNARI_SECRET ? 'SET (' + TWITTER.LUNARI_SECRET.length + ' chars)' : 'MISSING',
         };
-        const authHeaderPreview = authHeader.slice(0, 80) + '...';
-
         console.log('[TWITTER TEST]', JSON.stringify(results, null, 2));
-        res.writeHead(200);res.end(JSON.stringify({ credentials, authHeaderPreview, results }, null, 2));
-      }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message,stack:e.stack}));}
+        res.writeHead(200);res.end(JSON.stringify({ credentials, results }, null, 2));
+      }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
     });return;
   }
 
@@ -1109,9 +1048,83 @@ function handleRequest(req,res){
 
   if(req.method==='POST'&&url==='/schedules/delete'){let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{const{id}=JSON.parse(b);SCHEDULES=SCHEDULES.filter(s=>s.id!==id);res.writeHead(200);res.end(JSON.stringify({ok:true}));}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
 
+
   if(req.method==='POST'&&url==='/proxy/claude'){let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{const pl=JSON.parse(b);const apiKey=pl.apiKey||CONFIG.ANTHROPIC_KEY;const rb=pl.body;if(!apiKey||!rb){res.writeHead(400);return res.end(JSON.stringify({error:'Missing fields'}));}const bs=JSON.stringify(rb);const o={hostname:'api.anthropic.com',path:'/v1/messages',method:'POST',headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','anthropic-beta':'web-search-2025-03-05','Content-Length':Buffer.byteLength(bs)}};const pr=https.request(o,pres=>{let d='';pres.on('data',c=>d+=c);pres.on('end',()=>{res.writeHead(pres.statusCode,{'Content-Type':'application/json'});res.end(d);});});pr.on('error',e=>{res.writeHead(500);res.end(JSON.stringify({error:e.message}));});pr.write(bs);pr.end();}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
 
   // ── STREAMING PROXY ───────────────────────────────
+  // ── ATLAS LIVE RESEARCH ──────────────────────────
+  // When ATLAS is the agent, search Serper first then inject results
+  if(req.method==='POST'&&url==='/proxy/atlas'){
+    let b=''; req.on('data',c=>b+=c);
+    req.on('end',async()=>{
+      try {
+        const pl = JSON.parse(b);
+        const messages = pl.messages || [];
+        const lastMsg = messages[messages.length-1];
+        const query = lastMsg ? lastMsg.content : '';
+
+        // Run Serper search
+        let liveContext = '';
+        if (query && process.env.SERPER_API_KEY) {
+          const results = await serperSearch(query.slice(0, 200));
+          if (results && results.organic && results.organic.length) {
+            liveContext = '\n\n[LIVE WEB SEARCH RESULTS — use this real data in your response]:\n' +
+              results.organic.slice(0, 5).map((r, i) =>
+                `${i+1}. ${r.title}\n   ${r.snippet || ''}\n   Source: ${r.link || ''}`
+              ).join('\n\n');
+            if (results.answerBox) {
+              liveContext = '\n\n[TOP RESULT]: ' + (results.answerBox.answer || results.answerBox.snippet || '') + liveContext;
+            }
+            console.log('[ATLAS SERPER] Found', results.organic.length, 'results for:', query.slice(0,60));
+          }
+        }
+
+        // Build enhanced system prompt
+        const atlasSystem = (AGENT_SYSTEMS && AGENT_SYSTEMS.atlas) ||
+          'You are ATLAS, research and intelligence agent at LUNARI. You have access to live web search results. Always lead with the most current, specific data available. Surface insights others miss.';
+
+        const enhancedSystem = atlasSystem + liveContext;
+
+        // Stream to Anthropic with enhanced context
+        const body = {
+          model: 'claude-sonnet-4-6',
+          max_tokens: 2000,
+          stream: true,
+          system: enhancedSystem,
+          messages: messages
+        };
+        const bs = JSON.stringify(body);
+        const o = {
+          hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': CONFIG.ANTHROPIC_KEY,
+            'anthropic-version': '2023-06-01',
+            'Content-Length': Buffer.byteLength(bs)
+          }
+        };
+
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          'Access-Control-Allow-Origin': '*'
+        });
+
+        const pr = https.request(o, pres => {
+          pres.on('data', chunk => res.write(chunk));
+          pres.on('end', () => { res.write('data: [DONE]\n\n'); res.end(); });
+        });
+        pr.on('error', e => { res.write('data: {"error":"'+e.message+'"}\n\n'); res.end(); });
+        pr.write(bs); pr.end();
+
+      } catch(e) {
+        res.write('data: {"error":"'+e.message+'"}\n\n');
+        res.end();
+      }
+    }); return;
+  }
+
   if(req.method==='POST'&&url==='/proxy/stream'){
     let b=''; req.on('data',c=>b+=c);
     req.on('end',()=>{
