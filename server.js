@@ -520,14 +520,14 @@ function sendEmail(toEmail, subject, body, agentName) {
 async function sendMorningBrief(userEmail, userId) {
   if (!userEmail || !CONFIG.RESEND_API_KEY) return;
   try {
-    // Get user's recent context
-    const history = await sbFetch('GET', `chat_history?user_id=eq.${userId}&select=messages&limit=1`).catch(() => null);
+    // Get user's recent context — use sbAdmin to bypass RLS
+    const history = await sbAdmin('GET', `chat_history?user_id=eq.${userId}&select=messages&limit=1`).catch(() => null);
     const messages = (history && history[0] && history[0].messages) || [];
     const recentContext = messages.slice(-6).map(m =>
       `${m.role === 'user' ? 'User' : 'Crew'}: ${m.content.slice(0, 100)}`
     ).join('\n');
 
-    const credits = await sbFetch('GET', `user_credits?user_id=eq.${userId}&select=credits,plan&limit=1`).catch(() => null);
+    const credits = await sbAdmin('GET', `user_credits?user_id=eq.${userId}&select=credits,plan&limit=1`).catch(() => null);
     const fuel = (credits && credits[0]) ? credits[0].credits : 0;
     const plan = (credits && credits[0]) ? credits[0].plan : 'free';
 
@@ -546,14 +546,41 @@ async function sendMorningBrief(userEmail, userId) {
 }
 
 // ── Schedule runner ──────────────────────────────
-async function runSchedule(s){if(!s.enabled||!s.email||!CONFIG.ANTHROPIC_KEY)return;try{const r=await callClaude(s.agent,s.prompt,CONFIG.ANTHROPIC_KEY);await sendEmail(s.email,'LUNARI · '+s.name+' · '+new Date().toLocaleDateString(),r,s.agent);s.lastRun=new Date().toISOString();s.nextRun=getNextRun(s.schedule);}catch(e){console.error('[SCHEDULE]',e.message);}}
+async function runSchedule(s, overrideEmail) {
+  const email = overrideEmail || s.email;
+  if (!email || !CONFIG.ANTHROPIC_KEY) {
+    console.log('[SCHEDULE] Skipping "' + s.name + '" — no email' + (!CONFIG.ANTHROPIC_KEY ? ' and no API key' : ''));
+    return { ok: false, error: 'No email address configured' };
+  }
+  if (!s.enabled && !overrideEmail) {
+    console.log('[SCHEDULE] Skipping "' + s.name + '" — disabled');
+    return { ok: false, error: 'Schedule is disabled' };
+  }
+  try {
+    console.log('[SCHEDULE] Running "' + s.name + '" → ' + email);
+    const r = await callClaude(s.agent, s.prompt, CONFIG.ANTHROPIC_KEY);
+    const ok = await sendEmail(email, 'LUNARI · ' + s.name + ' · ' + new Date().toLocaleDateString(), r, s.agent);
+    s.lastRun = new Date().toISOString();
+    s.nextRun = getNextRun(s.schedule);
+    console.log('[SCHEDULE] "' + s.name + '" ' + (ok ? '✓ sent' : '✗ send failed'));
+    return { ok, result: r.slice(0, 200) };
+  } catch(e) {
+    console.error('[SCHEDULE] Error in "' + s.name + '":', e.message);
+    return { ok: false, error: e.message };
+  }
+}
 function tick() {
   const now = new Date();
-  SCHEDULES.forEach(s => { if(cronMatches(s.schedule, now)) runSchedule(s); });
+  SCHEDULES.forEach(s => { if(s.enabled && cronMatches(s.schedule, now)) runSchedule(s); });
 
   // Morning briefs — 8am daily
   if (now.getHours() === 8 && now.getMinutes() === 0) {
-    sendMorningBriefs().catch(e => console.error('[BRIEFS]', e.message));
+    sendMorningBriefs('morning').catch(e => console.error('[BRIEFS]', e.message));
+  }
+
+  // Evening brief — 6pm daily
+  if (now.getHours() === 18 && now.getMinutes() === 0) {
+    sendMorningBriefs('evening').catch(e => console.error('[BRIEFS]', e.message));
   }
 
   // Daily outreach — 9am
@@ -755,22 +782,56 @@ Return ONLY JSON: {"subject":"...","body":"..."}`;
     }
   }
 }
-async function sendMorningBriefs() {
-  console.log('[BRIEFS] Sending morning briefs...');
-  // Get all users who have opted in and have an email stored
-  const users = await sbFetch('GET', 'user_credits?morning_brief=eq.true&email=not.is.null&select=user_id,email&limit=500').catch(() => null);
+async function sendMorningBriefs(timeOfDay) {
+  const label = timeOfDay || 'morning';
+  console.log('[BRIEFS] Sending ' + label + ' briefs...');
+  // Use sbAdmin to bypass RLS — query correct column
+  const col = label === 'evening' ? 'evening_brief' : 'morning_brief';
+  const users = await sbAdmin('GET', `user_credits?${col}=eq.true&email=not.is.null&select=user_id,email&limit=500`).catch(() => null);
   if (!users || !users.length) {
-    console.log('[BRIEFS] No opted-in users found');
+    console.log('[BRIEFS] No opted-in users found for ' + label);
     return;
   }
-  console.log('[BRIEFS] Sending to', users.length, 'users');
+  console.log('[BRIEFS] Sending ' + label + ' to', users.length, 'users');
   for (const u of users) {
     try {
       if (u.email) {
-        await sendMorningBrief(u.email, u.user_id);
+        if (label === 'evening') {
+          await sendEveningBrief(u.email, u.user_id);
+        } else {
+          await sendMorningBrief(u.email, u.user_id);
+        }
         await new Promise(r => setTimeout(r, 500)); // rate limit
       }
     } catch(e) { console.error('[BRIEFS] User error:', e.message); }
+  }
+}
+
+async function sendEveningBrief(userEmail, userId) {
+  if (!userEmail || !CONFIG.RESEND_API_KEY) return;
+  try {
+    const history = await sbAdmin('GET', `chat_history?user_id=eq.${userId}&select=messages&limit=1`).catch(() => null);
+    const messages = (history && history[0] && history[0].messages) || [];
+    const recentContext = messages.slice(-8).map(m =>
+      `${m.role === 'user' ? 'User' : 'Crew'}: ${m.content.slice(0, 100)}`
+    ).join('\n');
+
+    const credits = await sbAdmin('GET', `user_credits?user_id=eq.${userId}&select=credits,plan,sites_built&limit=1`).catch(() => null);
+    const fuel = (credits && credits[0]) ? credits[0].credits : 0;
+    const plan = (credits && credits[0]) ? credits[0].plan : 'free';
+    const sites = (credits && credits[0]) ? credits[0].sites_built : 0;
+
+    const prompt = recentContext
+      ? `You are RAVEN, lead agent at LUNARI. Write a short evening wrap-up for this user. Summarize what they accomplished today, suggest what to tackle tomorrow, and give one motivating observation. Keep it under 120 words, warm but direct. Sign off as RAVEN.\n\nToday's activity:\n${recentContext}\n\nThey have ${fuel} Fuel, ${sites} sites built, on the ${plan} plan.`
+      : `You are RAVEN, lead agent at LUNARI. Write a short evening message for a user who hasn't been active today. Remind them the crew is here, give them one specific task to try tomorrow morning, and keep it encouraging. Under 100 words. Sign off as RAVEN.`;
+
+    const brief = await callClaude('raven', prompt, CONFIG.ANTHROPIC_KEY);
+    const today = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+
+    await sendEmail(userEmail, `🌙 RAVEN's Evening Wrap-Up — ${today}`, brief, 'raven');
+    console.log('[BRIEF] Evening sent to', userEmail);
+  } catch(e) {
+    console.error('[BRIEF] Evening error:', e.message);
   }
 }
 
@@ -1072,7 +1133,17 @@ function handleRequest(req,res){
     }));return;
   }
 
-  if(req.method==='POST'&&url==='/schedules/run'){let b='';req.on('data',c=>b+=c);req.on('end',async()=>{try{const{id}=JSON.parse(b);const s=SCHEDULES.find(s=>s.id===id);if(!s){res.writeHead(404);return res.end(JSON.stringify({error:'Not found'}));}runSchedule(s);res.writeHead(200);res.end(JSON.stringify({ok:true}));}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
+  if(req.method==='POST'&&url==='/schedules/run'){let b='';req.on('data',c=>b+=c);req.on('end',async()=>{try{const{id,email,userId}=JSON.parse(b);const s=SCHEDULES.find(s=>s.id===id);if(!s){res.writeHead(404);return res.end(JSON.stringify({error:'Not found'}));}
+    // Resolve email: explicit > schedule > lookup from userId
+    let toEmail = email || s.email;
+    if (!toEmail && userId) {
+      const rows = await sbAdmin('GET', `user_credits?user_id=eq.${userId}&select=email&limit=1`).catch(() => null);
+      if (rows && rows[0] && rows[0].email) toEmail = rows[0].email;
+    }
+    if (!toEmail) { res.writeHead(200);return res.end(JSON.stringify({ok:false,error:'No email address — set your email in Settings first'})); }
+    const result = await runSchedule(s, toEmail);
+    res.writeHead(200);res.end(JSON.stringify(result));
+  }catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
 
   if(req.method==='POST'&&url==='/schedules/add'){let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{const d=JSON.parse(b);const s={id:'s'+Date.now(),name:d.name||'New Schedule',agent:d.agent||'raven',prompt:d.prompt||'',schedule:d.schedule||'0 8 * * *',email:d.email||'',enabled:false,lastRun:null,nextRun:getNextRun(d.schedule||'0 8 * * *')};SCHEDULES.push(s);res.writeHead(200);res.end(JSON.stringify({ok:true,schedule:s}));}catch(e){res.writeHead(400);res.end(JSON.stringify({error:'Invalid JSON'}));}});return;}
 
@@ -1729,14 +1800,18 @@ Return ONLY valid JSON:
     });return;
   }
 
-  // Send morning brief on demand
+  // Send morning/evening brief on demand
   if(req.method==='POST'&&url==='/email/brief'){
     let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
       try{
-        const{toEmail,userId}=JSON.parse(b);
+        const{toEmail,userId,type}=JSON.parse(b);
         if(!toEmail||!userId){res.writeHead(400);return res.end(JSON.stringify({error:'Missing fields'}));}
-        await sendMorningBrief(toEmail,userId);
-        res.writeHead(200);res.end(JSON.stringify({ok:true}));
+        if (type === 'evening') {
+          await sendEveningBrief(toEmail, userId);
+        } else {
+          await sendMorningBrief(toEmail, userId);
+        }
+        res.writeHead(200);res.end(JSON.stringify({ok:true, type: type || 'morning'}));
       }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
     });return;
   }
