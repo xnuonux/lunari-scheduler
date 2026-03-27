@@ -688,40 +688,65 @@ function postLunariTweet(text) {
 
 async function runAutonomousTwitter() {
   console.log('[TWITTER AUTO] Running daily post...');
-  console.log('[TWITTER AUTO] API_KEY:', TWITTER.API_KEY ? 'SET' : 'MISSING');
-  console.log('[TWITTER AUTO] LUNARI_TOKEN:', TWITTER.LUNARI_TOKEN ? 'SET' : 'MISSING');
-  console.log('[TWITTER AUTO] LUNARI_SECRET:', TWITTER.LUNARI_SECRET ? 'SET' : 'MISSING');
-  console.log('[TWITTER AUTO] SERPER:', process.env.SERPER_API_KEY ? 'SET' : 'MISSING');
   if (!TWITTER.LUNARI_TOKEN || !CONFIG.ANTHROPIC_KEY) {
     console.log('[TWITTER AUTO] Aborting — missing credentials');
     return;
   }
   try {
-    const topics = ['AI tools for creators 2026', 'autonomous AI agents', 'solo founder productivity AI', 'AI marketing automation'];
-    const query = topics[new Date().getDay() % topics.length];
-    const results = await serperSearch(query);
-    let context = 'AI tools are transforming how solo creators and founders work';
+    // Tweet categories — GEN picks one randomly each post
+    const categories = [
+      { type: 'founder', search: 'solo founder struggle building alone startup', instruction: 'Write about the grind of building alone. The isolation, the obsession, the cost. Personal. Raw. Like a founder talking to themselves at 2am.' },
+      { type: 'founder', search: 'entrepreneur sacrifice ambition loneliness', instruction: 'Write about what nobody tells you about building something from nothing. The gap between the vision and the reality. No inspirational fluff — the real cost.' },
+      { type: 'philosophy', search: 'creative work meaning purpose autonomy', instruction: 'Write one sharp true thing about work, life, or creation. Not motivational. Just honest. The kind of thing someone screenshots and saves.' },
+      { type: 'philosophy', search: 'time freedom sovereignty independence', instruction: 'Write about what people actually want — not productivity, not growth hacks. Freedom. Time. Sovereignty over their own work. One true observation.' },
+      { type: 'build_update', search: 'AI agents autonomous tools 2026', instruction: 'Write a brief build update for @LunariPro. What the crew shipped, what changed, what is coming. Casual, lowercase, like a dev log at midnight. Mention LUNARI naturally.' },
+      { type: 'provocation', search: 'AI hype bubble startup culture critique', instruction: 'Write a contrarian take. Challenge something everyone assumes about AI, startups, or hustle culture. Sharp, not edgy for the sake of it. Say the thing people are thinking but not posting.' },
+      { type: 'human', search: 'music art creativity late night studio', instruction: 'Write something that has nothing to do with AI but everything to do with why someone would build LUNARI. About music, art, the creative grind, working while the world sleeps. Do NOT mention LUNARI or AI.' },
+      { type: 'human', search: 'ambition sacrifice legacy creating something', instruction: 'Write about the human side. Why people build. What drives the ones who keep going when it makes no sense. Do NOT mention LUNARI or AI or tech.' },
+    ];
+
+    const cat = categories[Math.floor(Math.random() * categories.length)];
+    console.log('[TWITTER AUTO] Category:', cat.type);
+
+    const results = await serperSearch(cat.search);
+    let context = '';
     if (results && results.organic) {
-      context = results.organic.slice(0, 3).map(r => r.title + ': ' + (r.snippet||'').slice(0,100)).join('\n');
+      context = results.organic.slice(0, 3).map(r => r.title + ': ' + (r.snippet || '').slice(0, 100)).join('\n');
     }
-    const prompt = `You are GEN, marketing agent for LUNARI (lunari.pro) — autonomous AI crew for solo creators.
 
-Trending today:\n${context}
+    const prompt = `You are the voice behind @LunariPro on X. Not a brand account. A founder who built something real in three days with no sleep and no code. The voice is raw, lowercase, personal.
 
-Write ONE sharp tweet for @LunariPro. Rules:
-- Under 240 characters
-- No hashtags, no corporate speak
-- Provocative insight OR contrarian take OR specific useful truth
-- Human voice. Confident. Not an ad.
-- Only mention LUNARI if completely natural
+Category for this tweet: ${cat.type}
+${cat.instruction}
 
-Return ONLY the tweet text.`;
+${context ? 'Context from the web (use for inspiration, not to summarize):\n' + context : ''}
+
+STRICT RULES:
+- lowercase throughout (LUNARI is the only exception when it appears)
+- under 220 characters
+- no hashtags ever. no emojis ever.
+- no quotation marks around the tweet
+- not an ad. not a pitch. not thought leadership.
+- reads like someone talking to themselves out loud
+- sometimes use "we" or "i" — this is personal
+- if category is "build_update" mention LUNARI. otherwise only mention it if completely natural. most tweets should NOT mention LUNARI.
+- never explain what LUNARI is. assume the reader already knows or doesn't need to.
+
+Examples of the right voice:
+- three days. no sleep. built something that works while i sleep now. that's the whole point.
+- the most ambitious people you know are usually the most alone. that's not a coincidence.
+- still up at 2am. the crew isn't. LUNARI.
+- everyone wants freedom but nobody wants to build the thing that gives it to them.
+- your favorite artist made their best work when nobody was watching. remember that.
+
+Return ONLY the tweet text. Nothing else.`;
+
     const tweet = await callClaude('gen', prompt, CONFIG.ANTHROPIC_KEY);
-    const clean = tweet.replace(/^["']|["']$/g, '').trim();
-    console.log('[TWITTER AUTO] Generated tweet:', clean);
+    const clean = tweet.replace(/^["']|["']$/g, '').replace(/^"|"$/g, '').trim();
+    console.log('[TWITTER AUTO] Category:', cat.type, '| Generated:', clean);
     const ok = await postLunariTweet(clean);
-    if (ok) console.log('[TWITTER AUTO] Posted successfully');
-    else console.log('[TWITTER AUTO] Post FAILED — check response above');
+    if (ok) console.log('[TWITTER AUTO] ✓ Posted successfully');
+    else console.log('[TWITTER AUTO] ✗ Post FAILED — check response above');
   } catch(e) { console.error('[TWITTER AUTO] Pipeline error:', e.message); }
 }
 
@@ -729,15 +754,36 @@ async function runTwitterEngagement() {
   if (!TWITTER.LUNARI_TOKEN || !CONFIG.ANTHROPIC_KEY) return;
   console.log('[TWITTER ENGAGE] Running...');
   try {
-    const terms = ['AI agent tools', 'autonomous AI', 'solo founder AI'];
-    const query = terms[new Date().getDay() % terms.length];
+    const topics = [
+      'solo founder building alone startup',
+      'creator economy independent artist',
+      'AI replacing jobs future work',
+      'late night coding shipping product',
+      'ambition vs burnout founder mental health'
+    ];
+    const query = topics[Math.floor(Math.random() * topics.length)];
     const results = await serperSearch(query + ' site:x.com');
     if (!results || !results.organic) return;
     const context = results.organic.slice(0, 3).map(r => r.title).join('\n');
-    const prompt = `You are X, execution agent for LUNARI. Write ONE sharp 180-char tweet that adds value to this AI conversation:\n${context}\nNo hashtags. No emojis. Smart observation, not an ad.\nReturn ONLY the tweet.`;
-    const tweet = await callClaude('x', prompt, CONFIG.ANTHROPIC_KEY);
-    await postLunariTweet(tweet.replace(/^["']|["']$/g, '').trim());
-    console.log('[TWITTER ENGAGE] Done');
+
+    const prompt = `You are the voice behind @LunariPro. Write one tweet that enters a conversation happening on X right now.
+
+What people are talking about:
+${context}
+
+RULES:
+- lowercase. under 200 characters. no hashtags. no emojis.
+- add something real to the conversation — an observation, a truth, a question
+- sound like a founder, not a brand
+- do NOT mention LUNARI unless it fits perfectly
+- not a reply to anyone specific — just a standalone thought that joins the vibe
+
+Return ONLY the tweet text.`;
+
+    const tweet = await callClaude('gen', prompt, CONFIG.ANTHROPIC_KEY);
+    const clean = tweet.replace(/^["']|["']$/g, '').replace(/^"|"$/g, '').trim();
+    await postLunariTweet(clean);
+    console.log('[TWITTER ENGAGE] Posted:', clean.slice(0, 80));
   } catch(e) { console.error('[TWITTER ENGAGE]', e.message); }
 }
 
