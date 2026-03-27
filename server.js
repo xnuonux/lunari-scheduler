@@ -531,17 +531,32 @@ async function sendMorningBrief(userEmail, userId) {
     const fuel = (credits && credits[0]) ? credits[0].credits : 0;
     const plan = (credits && credits[0]) ? credits[0].plan : 'free';
 
-    const briefPrompt = recentContext
-      ? `You are RAVEN, lead agent at LUNARI. Write a short morning brief for this user based on their recent activity. Keep it under 150 words, warm but direct. Sign off as RAVEN.\n\nRecent activity:\n${recentContext}\n\nThey have ${fuel} Fuel remaining on the ${plan} plan.`
-      : `You are RAVEN, lead agent at LUNARI. Write a short morning brief for a new user who hasn't chatted much yet. Welcome them, remind them what the crew can do, and give them one specific thing to try today. Under 150 words. Sign off as RAVEN.`;
+    // Fetch live news via Serper
+    let liveNews = '';
+    if (process.env.SERPER_API_KEY) {
+      const topics = ['AI tools solo founders 2026', 'startup news today', 'AI agents automation'];
+      const query = topics[new Date().getDay() % topics.length];
+      const results = await serperSearch(query);
+      if (results && results.organic && results.organic.length) {
+        liveNews = '\n\n[TODAY\'S NEWS — real data from the web, ' + new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }) + ']:\n' +
+          results.organic.slice(0, 5).map((r, i) =>
+            (i+1) + '. ' + r.title + '\n   ' + (r.snippet || '')
+          ).join('\n');
+      }
+    }
+
+    const briefPrompt = `You are RAVEN, lead agent at LUNARI. Write a morning brief for this user. Include 3-5 of the most relevant news items from the live data below — headline, one-sentence summary, and why it matters for solo founders. Then add a personal note based on their activity. Keep it under 250 words, warm but direct. Sign off as RAVEN.` +
+      (recentContext ? `\n\nRecent activity:\n${recentContext}` : '\n\nThis user is new — welcome them and suggest something to try today.') +
+      `\n\nThey have ${fuel} Fuel remaining on the ${plan} plan.` +
+      liveNews;
 
     const brief = await callClaude('raven', briefPrompt, CONFIG.ANTHROPIC_KEY);
     const today = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
 
     await sendEmail(userEmail, `🌙 RAVEN's Morning Brief — ${today}`, brief, 'raven');
-    console.log('[BRIEF] Sent to', userEmail);
+    console.log('[BRIEF] Morning sent to', userEmail);
   } catch(e) {
-    console.error('[BRIEF] Error:', e.message);
+    console.error('[BRIEF] Morning error:', e.message);
   }
 }
 
@@ -558,7 +573,27 @@ async function runSchedule(s, overrideEmail) {
   }
   try {
     console.log('[SCHEDULE] Running "' + s.name + '" → ' + email);
-    const r = await callClaude(s.agent, s.prompt, CONFIG.ANTHROPIC_KEY);
+
+    // Search the web first — give the agent live context
+    let liveContext = '';
+    if (process.env.SERPER_API_KEY) {
+      // Extract a search query from the prompt (first 120 chars, cleaned up)
+      const searchQuery = s.prompt.replace(/you are|write|generate|create|research|find|analyze/gi, '').trim().slice(0, 120);
+      const results = await serperSearch(searchQuery);
+      if (results && results.organic && results.organic.length) {
+        liveContext = '\n\n[LIVE WEB RESULTS — use this real, current data in your response. Today is ' + new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }) + ']:\n' +
+          results.organic.slice(0, 5).map((r, i) =>
+            (i+1) + '. ' + r.title + '\n   ' + (r.snippet || '') + '\n   Source: ' + (r.link || '')
+          ).join('\n\n');
+        if (results.answerBox) {
+          liveContext = '\n\n[TOP RESULT]: ' + (results.answerBox.answer || results.answerBox.snippet || '') + liveContext;
+        }
+        console.log('[SCHEDULE] Serper found', results.organic.length, 'results for "' + s.name + '"');
+      }
+    }
+
+    const enrichedPrompt = s.prompt + liveContext;
+    const r = await callClaude(s.agent, enrichedPrompt, CONFIG.ANTHROPIC_KEY);
     const ok = await sendEmail(email, 'LUNARI · ' + s.name + ' · ' + new Date().toLocaleDateString(), r, s.agent);
     s.lastRun = new Date().toISOString();
     s.nextRun = getNextRun(s.schedule);
