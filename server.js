@@ -1,4 +1,32 @@
-// LUNARI Scheduler + Execution Backend v4
+// LUNARI Scheduler + Execution Backend
+const LUNARI_VERSION = 'v4.8';
+const LUNARI_CHANGELOG = {
+  'v4.8': {
+    summary: 'site iteration is live. users can now edit and update their existing sites from chat. say "update my site" and the crew handles it.',
+    features: ['site iteration from chat', 'edit button in site gallery', 'multi-site picker', 'same URL redeployment']
+  },
+  'v4.7': {
+    summary: 'craft onboarding — the crew now asks what you do and tailors everything to your world. musician? photographer? model? the agents adapt.',
+    features: ['craft onboarding modal', 'craft-aware agent prompts', 'personalized morning briefs', 'craft-specific search']
+  },
+  'v4.6': {
+    summary: 'slack notifications, evening briefs, and the new twitter voice. the crew reports to you now.',
+    features: ['slack notifications', 'evening wrap-ups', 'twitter voice overhaul', 'tweet categories']
+  },
+  'v4.5': {
+    summary: 'email scheduling works. agents have internet access for all scheduled tasks via serper. morning briefs deliver real news.',
+    features: ['fixed email scheduling', 'serper in all schedules', 'morning briefs with live news', 'schedule run button upgrade']
+  },
+  'v4.4': {
+    summary: 'homepage demo chat — talk to the crew before signing up. agents cycle through and gradually lose interest until you join.',
+    features: ['demo chat widget', 'agent cycling', 'engagement degradation', 'main chat UI upgrade']
+  },
+  'v4.3': {
+    summary: 'twitter posting is live. fixed oauth 1.0a, scoping bug, and credential validation. first autonomous tweet posted.',
+    features: ['twitter oauth 1.0a fixed', 'scoping bug resolved', 'twitter test endpoint', 'autonomous posting confirmed']
+  }
+};
+
 const https  = require('https');
 const http   = require('http');
 const crypto = require('crypto');
@@ -46,6 +74,75 @@ function slackNotify(emoji, title, detail) {
     req.on('error', e => console.log('[SLACK] Send error:', e.message));
     req.write(body); req.end();
   } catch(e) { console.log('[SLACK] Invalid webhook URL'); }
+}
+
+// ── Deploy announcement — auto-tweet on version change ──
+async function checkAndAnnounceVersion() {
+  try {
+    const rows = await sbAdmin('GET', 'lunari_config?key=eq.deployed_version&select=value&limit=1').catch(() => null);
+    const lastVersion = (rows && rows[0]) ? rows[0].value : null;
+
+    if (lastVersion === LUNARI_VERSION) {
+      console.log('[VERSION] ' + LUNARI_VERSION + ' — no change');
+      return;
+    }
+
+    console.log('[VERSION] New deploy detected: ' + (lastVersion || 'unknown') + ' → ' + LUNARI_VERSION);
+
+    const changelog = LUNARI_CHANGELOG[LUNARI_VERSION];
+    if (!changelog) {
+      console.log('[VERSION] No changelog for ' + LUNARI_VERSION);
+      await sbAdmin('PATCH', 'lunari_config?key=eq.deployed_version', { value: LUNARI_VERSION, updated_at: new Date().toISOString() });
+      return;
+    }
+
+    // Slack notification with full details
+    slackNotify('🚀', 'LUNARI ' + LUNARI_VERSION + ' Deployed',
+      changelog.summary + '\n\n' + changelog.features.map(function(f) { return '• ' + f; }).join('\n'));
+
+    // Auto-tweet the update via GEN
+    if (TWITTER.LUNARI_TOKEN && CONFIG.ANTHROPIC_KEY) {
+      const prompt = 'You are the voice behind @LunariPro. A new version just shipped: ' + LUNARI_VERSION + '.\n\n' +
+        'What changed: ' + changelog.summary + '\n\n' +
+        'Write ONE tweet announcing this update. Rules:\n' +
+        '- lowercase throughout (LUNARI is the only exception)\n' +
+        '- under 220 characters\n' +
+        '- no hashtags, no emojis\n' +
+        '- sound like a founder shipping at 2am, not a press release\n' +
+        '- include the version number naturally\n' +
+        '- make it feel real and exciting without being corporate\n\n' +
+        'Examples of the right voice:\n' +
+        '- LUNARI v4.5 just dropped. your morning briefs now pull real news. the crew got smarter overnight.\n' +
+        '- shipped v4.6. the agents report to slack now. no more checking logs like an animal.\n' +
+        '- v4.7. the crew asks what you do now. musician? photographer? they adapt to your world.\n\n' +
+        'Return ONLY the tweet text.';
+
+      try {
+        const tweet = await callClaude('gen', prompt, CONFIG.ANTHROPIC_KEY);
+        const clean = tweet.replace(/^["']|["']$/g, '').replace(/^"|"$/g, '').trim();
+        console.log('[VERSION] Generated deploy tweet:', clean);
+        const ok = await postLunariTweet(clean);
+        if (ok) {
+          console.log('[VERSION] ✓ Deploy tweet posted');
+          slackNotify('🐦', 'Deploy Tweet Posted', clean);
+        } else {
+          console.log('[VERSION] ✗ Deploy tweet failed — check Twitter credits');
+        }
+      } catch(e) {
+        console.error('[VERSION] Tweet generation error:', e.message);
+      }
+    }
+
+    // Update stored version
+    await sbAdmin('PATCH', 'lunari_config?key=eq.deployed_version', {
+      value: LUNARI_VERSION,
+      updated_at: new Date().toISOString()
+    });
+    console.log('[VERSION] Stored version updated to ' + LUNARI_VERSION);
+
+  } catch(e) {
+    console.error('[VERSION] Error:', e.message);
+  }
 }
 
 // Demo chat rate limiter — per IP, resets hourly
@@ -1262,7 +1359,7 @@ function handleRequest(req,res){
   if(req.method==='OPTIONS'){res.writeHead(204);return res.end();}
   const url=req.url.split('?')[0];
 
-  if(url==='/'||url==='/health'){res.writeHead(200);return res.end(JSON.stringify({status:'online',service:'LUNARI v4',uptime:Math.floor(process.uptime())+'s',netlify:CONFIG.NETLIFY_TOKEN?'SET':'NOT SET',supabase:CONFIG.SUPABASE_URL?'SET':'NOT SET'}));}
+  if(url==='/'||url==='/health'){res.writeHead(200);return res.end(JSON.stringify({status:'online',service:'LUNARI',version:LUNARI_VERSION,uptime:Math.floor(process.uptime())+'s',netlify:CONFIG.NETLIFY_TOKEN?'SET':'NOT SET',supabase:CONFIG.SUPABASE_URL?'SET':'NOT SET'}));}
 
   if(req.method==='POST'&&url==='/execute'){
     let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
@@ -2632,7 +2729,12 @@ server.listen(CONFIG.PORT,()=>{
   console.log('[LUNARI] Netlify: '+(CONFIG.NETLIFY_TOKEN?'SET':'NOT SET'));
   console.log('[LUNARI] Supabase: '+(CONFIG.SUPABASE_URL?'SET':'NOT SET'));
   console.log('[LUNARI] Slack: '+(CONFIG.SLACK_WEBHOOK?'SET':'NOT SET'));
-  slackNotify('🟢', 'LUNARI v4 Online', 'Server deployed and running. All systems active.');
+  slackNotify('🟢', 'LUNARI ' + LUNARI_VERSION + ' Online', 'Server deployed and running. All systems active.');
+
+  // Check for version change and auto-tweet if new
+  setTimeout(function() {
+    checkAndAnnounceVersion().catch(function(e) { console.error('[VERSION]', e.message); });
+  }, 5000);
 });
 
 setInterval(tick, 60*1000);
