@@ -20,12 +20,33 @@ const CONFIG = {
   STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET    || '',
   TELEGRAM_TOKEN:        process.env.TELEGRAM_BOT_TOKEN       || '',
   RESEND_API_KEY:        process.env.RESEND_API_KEY           || '',
+  SLACK_WEBHOOK:         process.env.SLACK_WEBHOOK_URL        || '',
   FROM_EMAIL:            'LUNARI <system@lunari.pro>',
   PORT:                  process.env.PORT                     || 3000,
 };
 
 const BUILD_RESULTS = {};
 const PLAN_LIMITS   = { free: 1, starter: 1, subscriber: 1, pro: 2, studio: 5 };
+
+// ── Slack notifications ─────────────────────────
+function slackNotify(emoji, title, detail) {
+  if (!CONFIG.SLACK_WEBHOOK) return;
+  const text = emoji + ' *' + title + '*' + (detail ? '\n' + detail : '');
+  const body = JSON.stringify({ text });
+  try {
+    const url = new URL(CONFIG.SLACK_WEBHOOK);
+    const opts = {
+      hostname: url.hostname, path: url.pathname, method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+    };
+    const req = https.request(opts, res => {
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => { if (res.statusCode !== 200) console.log('[SLACK] Error:', res.statusCode, d); });
+    });
+    req.on('error', e => console.log('[SLACK] Send error:', e.message));
+    req.write(body); req.end();
+  } catch(e) { console.log('[SLACK] Invalid webhook URL'); }
+}
 
 // Demo chat rate limiter — per IP, resets hourly
 const DEMO_LIMITS = {};
@@ -356,6 +377,8 @@ async function executeBuild(task,userId,siteName,jobId) {
     await incrementSiteCount(userId);
     BUILD_RESULTS[jobId]={status:'done',url:result.url,siteId:result.siteId,message:'Live at '+result.url,userId,builtAt:new Date().toISOString()};
 
+    slackNotify('🌐', 'Site Built', result.url + (siteName ? ' — ' + siteName : ''));
+
     // Log build to Supabase
     await sbFetch('POST', 'site_builds', {
       user_id: userId,
@@ -520,22 +543,38 @@ function sendEmail(toEmail, subject, body, agentName) {
 async function sendMorningBrief(userEmail, userId) {
   if (!userEmail || !CONFIG.RESEND_API_KEY) return;
   try {
-    // Get user's recent context — use sbAdmin to bypass RLS
+    // Get user's recent context + craft — use sbAdmin to bypass RLS
     const history = await sbAdmin('GET', `chat_history?user_id=eq.${userId}&select=messages&limit=1`).catch(() => null);
     const messages = (history && history[0] && history[0].messages) || [];
     const recentContext = messages.slice(-6).map(m =>
       `${m.role === 'user' ? 'User' : 'Crew'}: ${m.content.slice(0, 100)}`
     ).join('\n');
 
-    const credits = await sbAdmin('GET', `user_credits?user_id=eq.${userId}&select=credits,plan&limit=1`).catch(() => null);
-    const fuel = (credits && credits[0]) ? credits[0].credits : 0;
-    const plan = (credits && credits[0]) ? credits[0].plan : 'free';
+    const userRow = await sbAdmin('GET', `user_credits?user_id=eq.${userId}&select=credits,plan,craft,craft_details&limit=1`).catch(() => null);
+    const fuel = (userRow && userRow[0]) ? userRow[0].credits : 0;
+    const plan = (userRow && userRow[0]) ? userRow[0].plan : 'free';
+    const craft = (userRow && userRow[0]) ? userRow[0].craft : null;
+    const craftDetails = (userRow && userRow[0]) ? userRow[0].craft_details : null;
+
+    // Craft-aware search queries
+    const craftSearchMap = {
+      musician: ['music industry news 2026', 'independent musician promotion', 'music streaming trends'],
+      photographer: ['photography business trends 2026', 'freelance photographer bookings', 'photography marketing tips'],
+      videographer: ['video production trends 2026', 'freelance videographer clients', 'video content creation'],
+      model: ['modeling industry news 2026', 'independent model career tips', 'casting calls modeling'],
+      visual_artist: ['art market trends 2026', 'independent artist promotion', 'art gallery submissions'],
+      designer: ['design industry trends 2026', 'freelance designer clients', 'design tools AI'],
+      writer: ['publishing industry news 2026', 'freelance writer opportunities', 'content writing trends'],
+      podcaster: ['podcast growth strategies 2026', 'content creator monetization', 'podcast audience building'],
+      founder: ['AI tools solo founders 2026', 'startup news today', 'AI agents automation'],
+    };
+    const defaultTopics = ['AI tools solo creators 2026', 'startup news today', 'creative career growth'];
+    const searchTopics = craftSearchMap[craft] || defaultTopics;
 
     // Fetch live news via Serper
     let liveNews = '';
     if (process.env.SERPER_API_KEY) {
-      const topics = ['AI tools solo founders 2026', 'startup news today', 'AI agents automation'];
-      const query = topics[new Date().getDay() % topics.length];
+      const query = searchTopics[new Date().getDay() % searchTopics.length];
       const results = await serperSearch(query);
       if (results && results.organic && results.organic.length) {
         liveNews = '\n\n[TODAY\'S NEWS — real data from the web, ' + new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }) + ']:\n' +
@@ -545,7 +584,10 @@ async function sendMorningBrief(userEmail, userId) {
       }
     }
 
-    const briefPrompt = `You are RAVEN, lead agent at LUNARI. Write a morning brief for this user. Include 3-5 of the most relevant news items from the live data below — headline, one-sentence summary, and why it matters for solo founders. Then add a personal note based on their activity. Keep it under 250 words, warm but direct. Sign off as RAVEN.` +
+    const craftLine = craft ? '\nThis user is a ' + craft + (craftDetails ? ' (' + craftDetails + ')' : '') + '. Tailor news and advice specifically to their craft and career.\n' : '';
+
+    const briefPrompt = `You are RAVEN, lead agent at LUNARI. Write a morning brief for this user. Include 3-5 of the most relevant news items from the live data below — headline, one-sentence summary, and why it matters for them specifically. Then add a personal note based on their activity. Keep it under 250 words, warm but direct. Sign off as RAVEN.` +
+      craftLine +
       (recentContext ? `\n\nRecent activity:\n${recentContext}` : '\n\nThis user is new — welcome them and suggest something to try today.') +
       `\n\nThey have ${fuel} Fuel remaining on the ${plan} plan.` +
       liveNews;
@@ -554,7 +596,8 @@ async function sendMorningBrief(userEmail, userId) {
     const today = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
 
     await sendEmail(userEmail, `🌙 RAVEN's Morning Brief — ${today}`, brief, 'raven');
-    console.log('[BRIEF] Morning sent to', userEmail);
+    console.log('[BRIEF] Morning sent to', userEmail, craft ? '(craft: ' + craft + ')' : '');
+    slackNotify('🌅', 'Morning Brief Sent', userEmail + (craft ? ' (' + craft + ')' : ''));
   } catch(e) {
     console.error('[BRIEF] Morning error:', e.message);
   }
@@ -598,6 +641,7 @@ async function runSchedule(s, overrideEmail) {
     s.lastRun = new Date().toISOString();
     s.nextRun = getNextRun(s.schedule);
     console.log('[SCHEDULE] "' + s.name + '" ' + (ok ? '✓ sent' : '✗ send failed'));
+    if (ok) slackNotify('📋', 'Schedule: ' + s.name, 'Sent to ' + email);
     return { ok, result: r.slice(0, 200) };
   } catch(e) {
     console.error('[SCHEDULE] Error in "' + s.name + '":', e.message);
@@ -745,7 +789,10 @@ Return ONLY the tweet text. Nothing else.`;
     const clean = tweet.replace(/^["']|["']$/g, '').replace(/^"|"$/g, '').trim();
     console.log('[TWITTER AUTO] Category:', cat.type, '| Generated:', clean);
     const ok = await postLunariTweet(clean);
-    if (ok) console.log('[TWITTER AUTO] ✓ Posted successfully');
+    if (ok) {
+      console.log('[TWITTER AUTO] ✓ Posted successfully');
+      slackNotify('🐦', 'Tweet Posted — @LunariPro', clean.slice(0, 200));
+    }
     else console.log('[TWITTER AUTO] ✗ Post FAILED — check response above');
   } catch(e) { console.error('[TWITTER AUTO] Pipeline error:', e.message); }
 }
@@ -897,20 +944,25 @@ async function sendEveningBrief(userEmail, userId) {
       `${m.role === 'user' ? 'User' : 'Crew'}: ${m.content.slice(0, 100)}`
     ).join('\n');
 
-    const credits = await sbAdmin('GET', `user_credits?user_id=eq.${userId}&select=credits,plan,sites_built&limit=1`).catch(() => null);
-    const fuel = (credits && credits[0]) ? credits[0].credits : 0;
-    const plan = (credits && credits[0]) ? credits[0].plan : 'free';
-    const sites = (credits && credits[0]) ? credits[0].sites_built : 0;
+    const userRow = await sbAdmin('GET', `user_credits?user_id=eq.${userId}&select=credits,plan,sites_built,craft,craft_details&limit=1`).catch(() => null);
+    const fuel = (userRow && userRow[0]) ? userRow[0].credits : 0;
+    const plan = (userRow && userRow[0]) ? userRow[0].plan : 'free';
+    const sites = (userRow && userRow[0]) ? userRow[0].sites_built : 0;
+    const craft = (userRow && userRow[0]) ? userRow[0].craft : null;
+    const craftDetails = (userRow && userRow[0]) ? userRow[0].craft_details : null;
+
+    const craftLine = craft ? '\nThis user is a ' + craft + (craftDetails ? ' (' + craftDetails + ')' : '') + '. Frame tomorrow\'s suggestions in terms of their craft and career goals.\n' : '';
 
     const prompt = recentContext
-      ? `You are RAVEN, lead agent at LUNARI. Write a short evening wrap-up for this user. Summarize what they accomplished today, suggest what to tackle tomorrow, and give one motivating observation. Keep it under 120 words, warm but direct. Sign off as RAVEN.\n\nToday's activity:\n${recentContext}\n\nThey have ${fuel} Fuel, ${sites} sites built, on the ${plan} plan.`
-      : `You are RAVEN, lead agent at LUNARI. Write a short evening message for a user who hasn't been active today. Remind them the crew is here, give them one specific task to try tomorrow morning, and keep it encouraging. Under 100 words. Sign off as RAVEN.`;
+      ? `You are RAVEN, lead agent at LUNARI. Write a short evening wrap-up for this user. Summarize what they accomplished today, suggest what to tackle tomorrow, and give one motivating observation. Keep it under 120 words, warm but direct. Sign off as RAVEN.${craftLine}\n\nToday's activity:\n${recentContext}\n\nThey have ${fuel} Fuel, ${sites} sites built, on the ${plan} plan.`
+      : `You are RAVEN, lead agent at LUNARI. Write a short evening message for a user who hasn't been active today. Remind them the crew is here, give them one specific task to try tomorrow morning, and keep it encouraging. Under 100 words. Sign off as RAVEN.${craftLine}`;
 
     const brief = await callClaude('raven', prompt, CONFIG.ANTHROPIC_KEY);
     const today = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
 
     await sendEmail(userEmail, `🌙 RAVEN's Evening Wrap-Up — ${today}`, brief, 'raven');
-    console.log('[BRIEF] Evening sent to', userEmail);
+    console.log('[BRIEF] Evening sent to', userEmail, craft ? '(craft: ' + craft + ')' : '');
+    slackNotify('🌙', 'Evening Wrap-Up Sent', userEmail + (craft ? ' (' + craft + ')' : ''));
   } catch(e) {
     console.error('[BRIEF] Evening error:', e.message);
   }
@@ -1232,6 +1284,32 @@ function handleRequest(req,res){
 
 
   // ── DEMO CHAT (homepage mini chat, no auth) ──────
+
+  // ── USER CRAFT ──────────────────────────────────
+  if(req.method==='POST'&&url==='/user/craft'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try{
+        const{userId,craft,craftDetails}=JSON.parse(b);
+        if(!userId||!craft){res.writeHead(400);return res.end(JSON.stringify({error:'Missing userId or craft'}));}
+        await sbAdmin('PATCH',`user_credits?user_id=eq.${userId}`,{craft:craft,craft_details:craftDetails||null});
+        console.log('[CRAFT] Saved for', userId, ':', craft, craftDetails ? '(' + craftDetails.slice(0,50) + ')' : '');
+        res.writeHead(200);res.end(JSON.stringify({ok:true}));
+      }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
+    });return;
+  }
+
+  if(req.method==='GET'&&url.startsWith('/user/craft')){
+    const params=new URL('http://x'+req.url).searchParams;
+    const userId=params.get('userId');
+    if(!userId){res.writeHead(400);return res.end(JSON.stringify({error:'Missing userId'}));}
+    sbAdmin('GET',`user_credits?user_id=eq.${userId}&select=craft,craft_details&limit=1`).then(function(rows){
+      res.writeHead(200);res.end(JSON.stringify(rows&&rows[0]?rows[0]:{craft:null,craft_details:null}));
+    }).catch(function(){
+      res.writeHead(200);res.end(JSON.stringify({craft:null,craft_details:null}));
+    });
+    return;
+  }
+
   if(req.method==='POST'&&url==='/proxy/demo'){
     let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
       try{
@@ -1833,6 +1911,7 @@ Return ONLY valid JSON:
         }
 
         console.log('[OUTREACH] Sent', sent, 'emails for', userId);
+        slackNotify('📧', 'Outreach Batch Sent', sent + ' emails delivered');
         res.writeHead(200);res.end(JSON.stringify({ok:true,sent,remaining:remaining-sent}));
       }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
     });return;
@@ -2170,6 +2249,7 @@ Return ONLY valid JSON:
                 updated_at: new Date().toISOString()
               });
               console.log('[STRIPE] ✓ Plan updated to', mapping.plan, 'for', userId);
+              slackNotify('🚀', 'New Subscriber', mapping.plan.toUpperCase() + ' plan — ' + (customerEmail || 'unknown'));
               // Send upgrade confirmation email
               if (customerEmail) {
                 await sendEmail(
@@ -2189,6 +2269,7 @@ Return ONLY valid JSON:
                 updated_at: new Date().toISOString()
               });
               console.log('[STRIPE] ✓ Added', mapping.credits, 'Fuel →', currentCredits + mapping.credits, 'total for', userId);
+              slackNotify('⚡', 'Fuel Purchased', mapping.credits + ' Fuel added → ' + (currentCredits + mapping.credits) + ' total');
               // Send fuel confirmation email
               if (customerEmail) {
                 await sendEmail(
@@ -2405,6 +2486,8 @@ server.listen(CONFIG.PORT,()=>{
   console.log('[LUNARI] Anthropic: '+(CONFIG.ANTHROPIC_KEY?'SET':'NOT SET'));
   console.log('[LUNARI] Netlify: '+(CONFIG.NETLIFY_TOKEN?'SET':'NOT SET'));
   console.log('[LUNARI] Supabase: '+(CONFIG.SUPABASE_URL?'SET':'NOT SET'));
+  console.log('[LUNARI] Slack: '+(CONFIG.SLACK_WEBHOOK?'SET':'NOT SET'));
+  slackNotify('🟢', 'LUNARI v4 Online', 'Server deployed and running. All systems active.');
 });
 
 setInterval(tick, 60*1000);
