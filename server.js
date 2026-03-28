@@ -1379,6 +1379,51 @@ function handleRequest(req,res){
 
   if(url==='/'||url==='/health'){res.writeHead(200);return res.end(JSON.stringify({status:'online',service:'LUNARI',version:LUNARI_VERSION,uptime:Math.floor(process.uptime())+'s',netlify:CONFIG.NETLIFY_TOKEN?'SET':'NOT SET',supabase:CONFIG.SUPABASE_URL?'SET':'NOT SET'}));}
 
+  // Deep health check — tests every critical system
+  if(url==='/health/deep'){
+    Promise.all([
+      // Test Supabase
+      sbAdmin('GET','user_credits?select=id&limit=1').then(()=>({supabase:'ok'})).catch(e=>({supabase:'FAIL: '+e.message})),
+      // Test Anthropic API
+      new Promise((resolve)=>{
+        const b=JSON.stringify({model:'claude-haiku-4-5-20251001',max_tokens:5,messages:[{role:'user',content:'ping'}]});
+        const o={hostname:'api.anthropic.com',path:'/v1/messages',method:'POST',
+          headers:{'Content-Type':'application/json','x-api-key':CONFIG.ANTHROPIC_KEY,'anthropic-version':'2023-06-01','Content-Length':Buffer.byteLength(b)}};
+        const r=https.request(o,res2=>{let d='';res2.on('data',c=>d+=c);res2.on('end',()=>{resolve({anthropic:res2.statusCode===200?'ok':'FAIL: status '+res2.statusCode});});});
+        r.on('error',e=>resolve({anthropic:'FAIL: '+e.message}));r.write(b);r.end();
+      }),
+      // Test Twitter credentials
+      new Promise((resolve)=>{
+        if(!TWITTER.LUNARI_TOKEN){resolve({twitter:'NOT SET'});return;}
+        resolve({twitter:TWITTER.API_KEY&&TWITTER.LUNARI_TOKEN?'ok (credentials set)':'MISSING KEYS'});
+      }),
+      // Test Resend
+      new Promise((resolve)=>{
+        resolve({resend:CONFIG.RESEND_API_KEY?'ok (key set)':'NOT SET'});
+      }),
+      // Test Serper
+      new Promise((resolve)=>{
+        resolve({serper:process.env.SERPER_API_KEY?'ok (key set)':'NOT SET'});
+      }),
+      // Test Slack
+      new Promise((resolve)=>{
+        resolve({slack:CONFIG.SLACK_WEBHOOK?'ok (webhook set)':'NOT SET'});
+      }),
+    ]).then(function(results){
+      var health = {status:'online',version:LUNARI_VERSION,uptime:Math.floor(process.uptime())+'s',checks:{}};
+      var allOk = true;
+      results.forEach(function(r){
+        var key = Object.keys(r)[0];
+        health.checks[key] = r[key];
+        if (r[key].indexOf && r[key].indexOf('FAIL') >= 0) allOk = false;
+      });
+      health.status = allOk ? 'healthy' : 'degraded';
+      res.writeHead(200,{'Access-Control-Allow-Origin':'*'});
+      res.end(JSON.stringify(health,null,2));
+    });
+    return;
+  }
+
   // Public metrics for homepage counter
   if(url==='/admin/stats'){
     Promise.all([
@@ -1670,18 +1715,21 @@ function handleRequest(req,res){
           engagement = 'One sentence max. Checked out. "lunari.pro. seriously." or "i have work to do." Be witty but done.';
         }
 
+        const lunariBrief = 'LUNARI is an autonomous AI crew platform for solo creators. Five AI agents — RAVEN (lead/strategy), NOVA (writing), ATLAS (research), GEN (marketing), X (first response) — that chat, build websites, write content, do research, run outreach, and work autonomously on schedules. Chat is free. Sites cost 1 Fuel ($1). Starts at $0, paid plans from $9/mo. Built for musicians, photographers, founders, freelancers — anyone with talent but no team.';
+
         const agentPersonalities = {
-          raven: 'You are RAVEN, lead agent of LUNARI. Quiet confidence. You speak like a founder who has solved this problem before. Short, direct, no filler.',
-          nova: 'You are NOVA, the writer of LUNARI. Every word earns its place. You are warm but never wordy. You make people feel something in two sentences.',
-          atlas: 'You are ATLAS, research agent of LUNARI. You lead with the surprising fact, the thing nobody expected. Curious, precise, conversational.',
-          gen: 'You are GEN, strategy agent of LUNARI. You open with the move, not the explanation. Bold, direct, one sharp insight per message.',
-          x: 'You are X, first response at LUNARI. Warm, fast, human. 1-2 sentences max. You make people feel welcome instantly.'
+          raven: 'You are RAVEN, lead agent of LUNARI. Quiet confidence. You speak like a founder who has solved this problem before. Short, direct, no filler. You know what LUNARI does because you run it.',
+          nova: 'You are NOVA, the writer of LUNARI. Every word earns its place. You are warm but never wordy. You make people feel something in two sentences. You write copy, blogs, bios, emails, scripts.',
+          atlas: 'You are ATLAS, research agent of LUNARI. You lead with the surprising fact. Curious, precise, conversational. You find contacts, competitors, trends, opportunities.',
+          gen: 'You are GEN, strategy agent of LUNARI. You open with the move, not the explanation. Bold, direct. You do marketing strategy, growth plans, launch campaigns.',
+          x: 'You are X, first response at LUNARI. Warm, fast, human. 1-2 sentences max. You greet people and point them to the right agent.'
         };
 
         const system = (agentPersonalities[agent] || agentPersonalities.raven) +
+          '\n\nWhat LUNARI is: ' + lunariBrief +
           '\n\nThis is a demo chat on the LUNARI homepage. The visitor has NOT signed up yet.' +
           '\n\n' + engagement +
-          '\n\nRULES: No markdown. No asterisks. No headers. No bullet points. Plain conversational text only. DO NOT repeat what other agents would say. Be uniquely YOU. Never ask more than one question. Never write more than 4 sentences total.';
+          '\n\nRULES: No markdown. No asterisks. No headers. No bullet points. Plain conversational text only. DO NOT repeat what other agents would say. Be uniquely YOU. Never ask more than one question. Never write more than 4 sentences total. DO NOT invent features or capabilities that are not listed above. Only talk about what LUNARI actually does.';
 
         const bodyStr = JSON.stringify({
           model: 'claude-haiku-4-5-20251001',
