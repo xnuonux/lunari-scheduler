@@ -694,7 +694,9 @@ function buildEmailHtml(subject, body, agentName) {
 
         <!-- Footer -->
         <tr><td style="padding-top:32px;text-align:center;color:#2a2b35;font-size:11px;font-family:monospace;">
-          LUNARI · lunari.pro · you're receiving this because you're part of the crew
+          LUNARI · <a href="https://lunari.pro" style="color:#2a2b35;">lunari.pro</a><br>
+          <span style="color:#1a1b25;font-size:10px;">you're receiving this because you signed up at lunari.pro<br>
+          <a href="https://lunari.pro" style="color:#1a1b25;">manage preferences</a> · <a href="mailto:system@lunari.pro?subject=unsubscribe" style="color:#1a1b25;">unsubscribe</a></span>
         </td></tr>
 
       </table>
@@ -715,9 +717,14 @@ function sendEmail(toEmail, subject, body, agentName) {
     const payload = JSON.stringify({
       from: CONFIG.FROM_EMAIL,
       to: [toEmail],
+      reply_to: 'dom@lunari.pro',
       subject: subject,
       html: html,
-      text: body.replace(/\*\*/g,'').replace(/\*/g,'').replace(/#+\s/g,'')
+      text: body.replace(/\*\*/g,'').replace(/\*/g,'').replace(/#+\s/g,''),
+      headers: {
+        'List-Unsubscribe': '<mailto:unsubscribe@lunari.pro>',
+        'X-Entity-Ref-ID': Date.now().toString()
+      }
     });
 
     const opts = {
@@ -1372,6 +1379,24 @@ function handleRequest(req,res){
 
   if(url==='/'||url==='/health'){res.writeHead(200);return res.end(JSON.stringify({status:'online',service:'LUNARI',version:LUNARI_VERSION,uptime:Math.floor(process.uptime())+'s',netlify:CONFIG.NETLIFY_TOKEN?'SET':'NOT SET',supabase:CONFIG.SUPABASE_URL?'SET':'NOT SET'}));}
 
+  // Public metrics for homepage counter
+  if(url==='/admin/stats'){
+    Promise.all([
+      sbAdmin('GET','site_builds?select=id&limit=1000').catch(()=>[]),
+      sbAdmin('GET','chat_history?select=messages&limit=1000').catch(()=>[])
+    ]).then(function(results){
+      var sites = results[0] ? results[0].length : 0;
+      var totalMessages = 0;
+      if (results[1]) results[1].forEach(function(row) { totalMessages += (row.messages ? row.messages.length : 0); });
+      res.writeHead(200,{'Access-Control-Allow-Origin':'*'});
+      res.end(JSON.stringify({sites:sites,messages:totalMessages,agents:5}));
+    }).catch(function(){
+      res.writeHead(200,{'Access-Control-Allow-Origin':'*'});
+      res.end(JSON.stringify({sites:0,messages:0,agents:5}));
+    });
+    return;
+  }
+
   if(req.method==='POST'&&url==='/execute'){
     let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
       try{
@@ -1682,6 +1707,7 @@ function handleRequest(req,res){
       try {
         const pl = JSON.parse(b);
         const messages = pl.messages || [];
+        const agentId = pl.agent || 'atlas';
         const lastMsg = messages[messages.length-1];
         const query = lastMsg ? lastMsg.content : '';
 
@@ -1697,24 +1723,38 @@ function handleRequest(req,res){
             if (results.answerBox) {
               liveContext = '\n\n[TOP RESULT]: ' + (results.answerBox.answer || results.answerBox.snippet || '') + liveContext;
             }
-            console.log('[ATLAS SERPER] Found', results.organic.length, 'results for:', query.slice(0,60));
+            console.log('[' + agentId.toUpperCase() + ' SERPER] Found', results.organic.length, 'results for:', query.slice(0,60));
           }
         }
 
-        // Build enhanced system prompt
-        const atlasSystem = (AGENT_SYSTEMS && AGENT_SYSTEMS.atlas) ||
-          'You are ATLAS, research and intelligence agent at LUNARI. You have access to live web search results. Always lead with the most current, specific data available. Surface insights others miss.';
+        // Use the correct agent's system prompt and model
+        const agentSystem = (AGENT_SYSTEMS && AGENT_SYSTEMS[agentId]) || AGENT_SYSTEMS.atlas;
+        const enhancedSystem = agentSystem + liveContext;
 
-        const enhancedSystem = atlasSystem + liveContext;
+        // RAVEN gets smart model selection — Opus for complex, Sonnet for casual
+        let model = 'claude-sonnet-4-6';
+        if (agentId === 'raven') {
+          const lower = query.toLowerCase();
+          const complexSignals = ['strategy','plan','build','analyze','think through','help me','roadmap','architecture','design','compare','evaluate','decision','advise','review','how should','what should'];
+          const isComplex = complexSignals.some(s => lower.indexOf(s) >= 0) || query.split(' ').length > 40;
+          model = isComplex ? 'claude-opus-4-6' : 'claude-sonnet-4-6';
+        }
 
         // Stream to Anthropic with enhanced context
         const body = {
-          model: 'claude-sonnet-4-6',
+          model: model,
           max_tokens: 2000,
           stream: true,
           system: enhancedSystem,
           messages: messages
         };
+
+        // Enable extended thinking for RAVEN on Opus
+        if (agentId === 'raven' && model === 'claude-opus-4-6') {
+          body.thinking = { type: 'enabled', budget_tokens: 4000 };
+          body.max_tokens = 4000;
+          body.temperature = 1;
+        }
         const bs = JSON.stringify(body);
         const o = {
           hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
