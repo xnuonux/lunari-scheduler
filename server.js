@@ -1727,15 +1727,30 @@ function handleRequest(req,res){
 
         const system = (agentPersonalities[agent] || agentPersonalities.raven) +
           '\n\nWhat LUNARI is: ' + lunariBrief +
-          '\n\nThis is a demo chat on the LUNARI homepage. The visitor has NOT signed up yet.' +
+          '\n\nThis is a demo chat on the LUNARI homepage. The visitor has NOT signed up yet. You are in a GROUP CHAT with the other agents — they may have already spoken. Read the conversation history carefully.' +
           '\n\n' + engagement +
-          '\n\nRULES: No markdown. No asterisks. No headers. No bullet points. Plain conversational text only. DO NOT repeat what other agents would say. Be uniquely YOU. Never ask more than one question. Never write more than 4 sentences total. DO NOT invent features or capabilities that are not listed above. Only talk about what LUNARI actually does.';
+          '\n\nRULES: No markdown. No asterisks. No headers. No bullet points. Plain conversational text only. Never write more than 4 sentences total. DO NOT invent features not listed above.' +
+          '\n\nCRITICAL COHESION RULES:' +
+          '\n- Read the ENTIRE conversation before responding. The visitor already told another agent what they do — do NOT ask again.' +
+          '\n- Never repeat a question another agent already asked.' +
+          '\n- Never repeat information another agent already gave.' +
+          '\n- Build on what was said before — reference the visitor\'s specific situation.' +
+          '\n- If someone said they\'re a restaurant owner, talk about RESTAURANTS, not generic "solo creators."' +
+          '\n- Your job is to ADD value to the conversation, not restart it.';
+
+        // Build messages array with conversation history for context
+        const history = (pl.history || []).map(function(m) {
+          return { role: m.role, content: (m.content || '').slice(0, 300) };
+        }).slice(-8); // Keep last 8 messages for context
+
+        // Ensure the array ends with the user's latest message
+        const messages = history.length > 0 ? history : [{ role: 'user', content: userMsg }];
 
         const bodyStr = JSON.stringify({
           model: 'claude-haiku-4-5-20251001',
           max_tokens: maxTokens,
           system: system,
-          messages: [{ role: 'user', content: userMsg }]
+          messages: messages
         });
         const opts = {
           hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
@@ -1816,8 +1831,8 @@ function handleRequest(req,res){
 
         // Enable extended thinking for RAVEN on Opus
         if (agentId === 'raven' && model === 'claude-opus-4-6') {
-          body.thinking = { type: 'enabled', budget_tokens: 4000 };
-          body.max_tokens = 4000;
+          body.thinking = { type: 'enabled', budget_tokens: 3000 };
+          body.max_tokens = 8000;
           body.temperature = 1;
         }
         const bs = JSON.stringify(body);
