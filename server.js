@@ -1464,6 +1464,24 @@ function handleRequest(req,res){
     });return;
   }
 
+  // Custom tweet to @LunariPro — accepts exact text
+  if(req.method==='POST'&&url==='/twitter/post-custom'){
+    let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
+      try{
+        const{text}=JSON.parse(b);
+        if(!text){res.writeHead(400);return res.end(JSON.stringify({error:'Missing text'}));}
+        const clean = text.replace(/^["']|["']$/g, '').trim().slice(0, 280);
+        const ok = await postLunariTweet(clean);
+        if (ok) {
+          slackNotify('🐦', 'Tweet Posted — @LunariPro', clean.slice(0, 200));
+          res.writeHead(200);res.end(JSON.stringify({ok:true,url:'https://twitter.com/LunariPro'}));
+        } else {
+          res.writeHead(200);res.end(JSON.stringify({ok:false,error:'Tweet failed — check X API credits'}));
+        }
+      }catch(e){res.writeHead(500);res.end(JSON.stringify({error:e.message}));}
+    });return;
+  }
+
   // Twitter diagnostic — tests credentials layer by layer
   if(req.method==='POST'&&url==='/twitter/test'){
     let b='';req.on('data',c=>b+=c);req.on('end',async()=>{
